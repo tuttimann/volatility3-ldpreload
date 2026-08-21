@@ -23,7 +23,9 @@ its modification time, the libc functions the library overrides, the PIDs mappin
 and a note. Both timestamps also feed ``linux.timeliner``. A preload library is mapped
 into essentially every process, so ``Mapped PIDs`` collapses consecutive PIDs into
 inclusive ``first-last`` ranges (e.g. ``1, 549, 685-691, ...``); the rendering is
-lossless.
+lossless. Long cells (function lists, PID lists, notes) are folded into short lines
+so that ``-r pretty`` prints them as narrow blocks; ``--wrap 0`` keeps them on one
+line for ``-r json`` and ``-r csv``.
 
 Detecting dynamic-linker patching
 ---------------------------------
@@ -98,6 +100,7 @@ import logging
 import re
 import stat
 import struct
+import textwrap
 from dataclasses import dataclass, field
 from io import BytesIO
 from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple, Union
@@ -883,7 +886,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
     """Recovers ld.so.preload from the page cache and reports the libc functions its libraries override."""
 
     _required_framework_version = (2, 0, 0)
-    _version = (1, 3, 2)
+    _version = (1, 3, 3)
 
     @classmethod
     def get_requirements(cls) -> List[interfaces.configuration.RequirementInterface]:
@@ -939,6 +942,14 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                 description="Do not walk process mappings to find which processes have "
                 "the library loaded (faster)",
                 default=False,
+                optional=True,
+            ),
+            requirements.IntRequirement(
+                name="wrap",
+                description="Fold long cells (function lists, PID lists, notes) into "
+                "lines of at most this many characters, so the table stays narrow "
+                "with -r pretty; 0 keeps every cell on one line (for -r json/csv)",
+                default=48,
                 optional=True,
             ),
             requirements.BooleanRequirement(
@@ -2225,6 +2236,30 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             "modification time (mtime preserved from an original or set deliberately)"
         )
 
+    def _wrap(self, text: str, width: int) -> str:
+        """Folds a long cell at word boundaries into lines of at most ``width``.
+
+        The text renderers print a cell containing newlines as a block, so a
+        long list no longer dictates the width of the whole table. As with the
+        hexdump and disassembly cells of ``malfind``, a folded block starts with
+        a newline, so the tab-separated renderer shows the row's scalar fields
+        on one line and the block underneath. Each line is padded to the block
+        width, which turns the pretty renderer's right alignment into a
+        left-aligned block. ``--wrap 0`` disables folding for consumers of
+        ``-r json`` / ``-r csv`` that want single-line cells."""
+        limit = self.config.get("wrap", 0)
+        if not limit:
+            return text
+        width = min(width, limit)
+        lines = textwrap.wrap(
+            text, width, break_long_words=False, break_on_hyphens=False
+        )
+        if len(lines) <= 1:
+            return text
+        # Pad to the column's wrap width rather than this block's own width, so
+        # every block in a column starts at the same position.
+        return "\n" + "\n".join(line.ljust(width) for line in lines)
+
     def _generator(self):
         entries = self._collect()
 
@@ -2244,7 +2279,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             notes = [entry.detection]
             if elf is not None and elf.valid:
                 functions = elf.exported if show_all else elf.interposed()
-                hooks = ", ".join(functions) if functions else nap()
+                hooks = self._wrap(", ".join(functions), 48) if functions else nap()
             else:
                 hooks = na()
                 if recovered is not None and not recovered.data:
@@ -2274,11 +2309,11 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                     (recovered.modification_time if recovered else None) or na(),
                     hooks,
                     (
-                        self._format_pids(entry.mapped_pids)
+                        self._wrap(self._format_pids(entry.mapped_pids), 32)
                         if entry.mapped_pids
                         else nap()
                     ),
-                    note or nap(),
+                    self._wrap(note, 48) if note else nap(),
                 ),
             )
 
@@ -2321,7 +2356,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                     na(),
                     na(),
                     nap(),
-                    f"{note}; {stamp}" if stamp else note,
+                    self._wrap(f"{note}; {stamp}" if stamp else note, 48),
                 ),
             )
 
@@ -2344,7 +2379,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                     na(),
                     na(),
                     nap(),
-                    f"{note}; {stamp}" if stamp else note,
+                    self._wrap(f"{note}; {stamp}" if stamp else note, 48),
                 ),
             )
 

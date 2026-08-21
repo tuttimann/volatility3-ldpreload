@@ -3,6 +3,14 @@
 All notable changes to `linux.ldpreload` are documented here. Versions follow the
 plugin's `_version` tuple.
 
+## 1.3.3 (2026-08-21)
+
+- Long cells (function lists, PID lists, notes) are folded into lines of at most
+  `--wrap` characters (default 48). The text renderers print such a cell as a block,
+  the way `malfind` shows hexdumps, so the table stays narrow with `-r pretty`
+  regardless of how many functions a library hooks. `--wrap 0` restores single-line
+  cells for `-r json` / `-r csv`.
+
 ## 1.3.2 (2026-08-21)
 
 - Columns `Preload File` / `Preload Modification Time` renamed to `File` /
