@@ -219,9 +219,8 @@ linker-patching tool and custom preload libraries, plus clean images of the same
 ## Repository layout
 
 ```
-linux/ldpreload.py          the plugin (single file)
-docs/design.md              write-up: motivation and design
-CHANGELOG.md                version history
+linux/ldpreload.py   the plugin (single file)
+CHANGELOG.md         version history
 ```
 
 ## License
