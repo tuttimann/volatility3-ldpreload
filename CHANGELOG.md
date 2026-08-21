@@ -3,6 +3,12 @@
 All notable changes to `linux.ldpreload` are documented here. Versions follow the
 plugin's `_version` tuple.
 
+## 1.3.4 (2026-08-21)
+
+- Folding of long cells now applies only when the pretty renderer consumes the output;
+  the tab-separated default renderer, JSON and CSV get single-line cells again.
+  `--wrap N` forces folding for any renderer, `--wrap 0` disables it.
+
 ## 1.3.3 (2026-08-21)
 
 - Long cells (function lists, PID lists, notes) are folded into lines of at most

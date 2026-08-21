@@ -23,9 +23,9 @@ its modification time, the libc functions the library overrides, the PIDs mappin
 and a note. Both timestamps also feed ``linux.timeliner``. A preload library is mapped
 into essentially every process, so ``Mapped PIDs`` collapses consecutive PIDs into
 inclusive ``first-last`` ranges (e.g. ``1, 549, 685-691, ...``); the rendering is
-lossless. Long cells (function lists, PID lists, notes) are folded into short lines
-so that ``-r pretty`` prints them as narrow blocks; ``--wrap 0`` keeps them on one
-line for ``-r json`` and ``-r csv``.
+lossless. With ``-r pretty`` the long cells (function lists, PID lists, notes) are
+folded into short lines that the renderer prints as narrow blocks; every other
+renderer gets single-line cells (``--wrap`` overrides either way).
 
 Detecting dynamic-linker patching
 ---------------------------------
@@ -100,6 +100,7 @@ import logging
 import re
 import stat
 import struct
+import sys
 import textwrap
 from dataclasses import dataclass, field
 from io import BytesIO
@@ -886,7 +887,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
     """Recovers ld.so.preload from the page cache and reports the libc functions its libraries override."""
 
     _required_framework_version = (2, 0, 0)
-    _version = (1, 3, 3)
+    _version = (1, 3, 4)
 
     @classmethod
     def get_requirements(cls) -> List[interfaces.configuration.RequirementInterface]:
@@ -947,9 +948,9 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             requirements.IntRequirement(
                 name="wrap",
                 description="Fold long cells (function lists, PID lists, notes) into "
-                "lines of at most this many characters, so the table stays narrow "
-                "with -r pretty; 0 keeps every cell on one line (for -r json/csv)",
-                default=48,
+                "lines of at most this many characters. By default folding is "
+                "applied only for the pretty renderer (-r pretty), where it keeps "
+                "the table narrow; a value forces it for any renderer, 0 disables it",
                 optional=True,
             ),
             requirements.BooleanRequirement(
@@ -969,6 +970,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
         #: disguised preload path -> path of the patched loader that names it
         self._confirmed_by: Dict[str, str] = {}
         self._dumped = False
+        self._limit = 0
         self._platform = "x86_64"
         self._libdir = "lib64"
 
@@ -2236,18 +2238,43 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             "modification time (mtime preserved from an original or set deliberately)"
         )
 
+    @staticmethod
+    def _pretty_renderer_active() -> bool:
+        """Whether the pretty text renderer is the consumer of the grid.
+
+        The framework does not tell a plugin which renderer it feeds, but the
+        generator runs while that renderer's ``render()`` is on the call stack,
+        so it can be recognised there. Anything else (the tab-separated default,
+        JSON, CSV, library use) gets single-line cells."""
+        try:
+            from volatility3.cli import text_renderer
+        except ImportError:
+            return False
+        frame = sys._getframe()
+        while frame is not None:
+            if isinstance(frame.f_locals.get("self"), text_renderer.PrettyTextRenderer):
+                return True
+            frame = frame.f_back
+        return False
+
+    def _fold_limit(self) -> int:
+        """Maximum line length for folded cells; 0 leaves cells on one line."""
+        configured = self.config.get("wrap")
+        if configured is not None:
+            return max(0, int(configured))
+        return 48 if self._pretty_renderer_active() else 0
+
     def _wrap(self, text: str, width: int) -> str:
         """Folds a long cell at word boundaries into lines of at most ``width``.
 
         The text renderers print a cell containing newlines as a block, so a
         long list no longer dictates the width of the whole table. As with the
         hexdump and disassembly cells of ``malfind``, a folded block starts with
-        a newline, so the tab-separated renderer shows the row's scalar fields
-        on one line and the block underneath. Each line is padded to the block
-        width, which turns the pretty renderer's right alignment into a
-        left-aligned block. ``--wrap 0`` disables folding for consumers of
-        ``-r json`` / ``-r csv`` that want single-line cells."""
-        limit = self.config.get("wrap", 0)
+        a newline, so the row's scalar fields stay on one line and the block
+        sits underneath. Each line is padded to the wrap width, which turns the
+        pretty renderer's right alignment into left-aligned blocks. Folding is
+        applied only when it helps (see ``_fold_limit``)."""
+        limit = self._limit
         if not limit:
             return text
         width = min(width, limit)
@@ -2262,6 +2289,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
 
     def _generator(self):
         entries = self._collect()
+        self._limit = self._fold_limit()
 
         if self.config.get("dump") and not self._dumped:
             self._dump(entries)

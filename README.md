@@ -83,11 +83,12 @@ with running processes.
 | `--no-scan` | Disable the content scan, the dynamic-linker integrity check and the tamper-artifact check; only `/etc/ld.so.preload` is used. |
 | `--all-symbols` | List every exported function of each library, not only those that shadow a known libc/PAM/pcap function. |
 | `--skip-maps` | Do not walk process mappings (faster; `Mapped PIDs` stays empty). |
-| `--wrap N` | Fold the long cells (function lists, PID lists, notes) into lines of at most `N` characters (default 48), so `-r pretty` prints them as narrow blocks. `--wrap 0` keeps every cell on one line, for `-r json` / `-r csv`. |
+| `--wrap N` | Fold the long cells (function lists, PID lists, notes) into lines of at most `N` characters. By default this happens only with `-r pretty`, which prints the folded cells as narrow blocks; every other renderer gets single-line cells. A value forces folding for any renderer, `0` disables it. |
 | `--dump` | Write the preload file(s), every resolved library, every patched loader and any linker artifact to the output directory (`-o`). |
 
-The output is easiest to read with the pretty renderer, which prints the folded cells
-as aligned blocks:
+The output is easiest to read with the pretty renderer, where the long cells are folded
+into aligned blocks (the default tab-separated renderer and JSON/CSV keep one line per
+row):
 
 ```bash
 vol -r pretty -f image.lime linux.ldpreload.LdPreload
@@ -108,8 +109,8 @@ vol -f image.lime linux.ldpreload.LdPreload --no-scan --skip-maps
 # Put the findings on the system timeline
 vol -f image.lime timeliner.Timeliner --plugin-filter linux.ldpreload
 
-# Machine-readable, one line per cell
-vol -r json -f image.lime linux.ldpreload.LdPreload --wrap 0
+# Machine-readable
+vol -r json -f image.lime linux.ldpreload.LdPreload
 ```
 
 ## Output
