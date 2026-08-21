@@ -108,18 +108,18 @@ loader copy. Seven columns:
 
 | Column | Meaning |
 |---|---|
-| Preload File | Path of the preload file as cached (`/etc/ld.so.preload`, a renamed copy, or the disguised name). For linker rows: the loader's path. |
-| Preload Modification Time | Its `mtime`, i.e. when the persistence was installed or last changed. |
+| File | Path of the file the row is about, as cached: the preload file (`/etc/ld.so.preload`, a renamed copy, or the disguised name), or the dynamic linker / linker copy for linker rows. |
+| File Modification Time | That file's `mtime`: when the preload file was written, or when the loader was patched. |
 | Library | The shared object the line names, exactly as written (tokens such as `$PLATFORM` are kept). `(dynamic linker)` / `(dynamic linker copy)` for linker rows. |
 | Library Modification Time | The recovered library's `mtime`. |
 | Overridden Functions | Global `FUNC` symbols in the library's `.dynsym` that shadow a libc/PAM/pcap function of interest (or everything, with `--all-symbols`). |
 | Mapped PIDs | Processes that currently map the library; consecutive PIDs collapsed into `first-last` ranges. |
-| Notes | How the file was found, what a patched loader reads, and anything that limits the analysis. |
+| Notes | How the file was found, what a patched loader reads, anything that limits the analysis, and a warning when a file's change time is well after its modification time (the `mtime` was preserved from an original or set deliberately; the change time is when the file really got its content). |
 
 A classic infection (standard file, bdvl-style library name) on a RHEL 9 host:
 
 ```
-Preload File        Preload Modification Time   Library              Library Modification Time   Overridden Functions                                   Mapped PIDs                              Notes
+File                File Modification Time      Library              Library Modification Time   Overridden Functions                                   Mapped PIDs                              Notes
 /etc/ld.so.preload  2026-08-14 18:13:07 UTC     /lib64/selinux.so.3  2026-08-14 18:12:53 UTC     __lxstat, __lxstat64, accept, access, execve,          1, 549, 571, 605, 607, 682, 685-691, ...   N/A
                                                                                                   fopen, fopen64, fstat, lstat, open, open64, openat,
                                                                                                   opendir, pam_authenticate, readdir, unlink, unlinkat
@@ -131,7 +131,7 @@ functions its library overrides, proves that both the 64-bit and the 32-bit load
 patched to read it, and reports the copy of the original loader the patch left behind:
 
 ```
-Preload File               Library                                    Overridden Functions                    Mapped PIDs  Notes
+File                       Library                                    Overridden Functions                    Mapped PIDs  Notes
 /etc/shadowrddoqnf         /bin/opensslbn/libopensslbn.so.$PLATFORM   __fxstat, __fxstat64, __lxstat,         14548        disguised preload file: the dynamic linker
                                                                       __lxstat64, __xstat, __xstat64, accept,              /usr/lib64/ld-2.17.so is patched to read it
                                                                       access, execve, execvp, fopen, fopen64,              instead of /etc/ld.so.preload
@@ -141,7 +141,10 @@ Preload File               Library                                    Overridden
 /usr/lib64/ld-2.17.so      (dynamic linker)                           -                                       N/A          patched dynamic linker: reads /etc/shadowrddoqnf
                                                                                                                            (analysed above) instead of /etc/ld.so.preload
 /usr/lib64/ld-2.17.so.tmp  (dynamic linker copy)                      -                                       N/A          leftover copy of the dynamic linker, consistent
-                                                                                                                           with an in-place patch of ld.so
+                                                                                                                           with an in-place patch of ld.so; copy changed at
+                                                                                                                           2026-08-20 07:24:38 UTC, after its modification
+                                                                                                                           time (mtime preserved from an original or set
+                                                                                                                           deliberately)
 ```
 
 A clean system produces an empty table and an informational log line saying that no
@@ -159,9 +162,13 @@ preload file is present.
   or the last mass restart. Mapped by nothing: installed moments before the capture
   (the file's `mtime` usually confirms it).
 - A **`(dynamic linker)` row** means the loader itself is modified; removing the
-  library is not enough, glibc has to be restored. Its note says which file the loader
-  reads and whether that file was analysed above, is cached but unreadable, or is not
-  in the page cache at all.
+  library is not enough, glibc has to be restored. Its `File Modification Time` is when
+  the loader was patched. Its note says which file the loader reads and whether that
+  file was analysed above, is cached but unreadable, or is not in the page cache at all.
+- **Timestamps you cannot trust are flagged.** Userland can set a file's `mtime`
+  (`cp -p`, `touch -r`) but not the inode's change time. When the change time is well
+  after the `mtime`, the note says so and gives the change time; that is when the file
+  really got its content, whatever the `mtime` claims.
 
 ## How it works
 

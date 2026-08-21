@@ -3,6 +3,15 @@
 All notable changes to `linux.ldpreload` are documented here. Versions follow the
 plugin's `_version` tuple.
 
+## 1.3.2 (2026-08-21)
+
+- Columns `Preload File` / `Preload Modification Time` renamed to `File` /
+  `File Modification Time`: for a dynamic-linker row they hold the loader's path and
+  the time it was patched, which the old names obscured.
+- A file whose inode change time is well after its modification time gets a note with
+  the change time: the `mtime` was preserved from an original or set deliberately, and
+  the change time is when the file really got its content.
+
 ## 1.3.1 (2026-08-20)
 
 - Overridden-function matching knows the pre-glibc-2.33 export names of the `stat`

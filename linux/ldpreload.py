@@ -871,6 +871,7 @@ class PreloadEntry:
     preload_path: str
     library: str
     preload_mtime: Optional[datetime.datetime] = None
+    preload_ctime: Optional[datetime.datetime] = None
     recovered: Optional[RecoveredFile] = None
     elf: Optional[ElfInfo] = None
     mapped_pids: List[int] = field(default_factory=list)
@@ -882,7 +883,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
     """Recovers ld.so.preload from the page cache and reports the libc functions its libraries override."""
 
     _required_framework_version = (2, 0, 0)
-    _version = (1, 3, 1)
+    _version = (1, 3, 2)
 
     @classmethod
     def get_requirements(cls) -> List[interfaces.configuration.RequirementInterface]:
@@ -1423,6 +1424,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                     preload_path=preload.path,
                     library=name,
                     preload_mtime=preload.modification_time,
+                    preload_ctime=preload.change_time,
                     detection=detection,
                 )
                 resolved = self._lookup(name, libraries)
@@ -2203,6 +2205,26 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
         parts.append(str(start) if start == prev else f"{start}-{prev}")
         return ", ".join(parts)
 
+    @staticmethod
+    def _timestamp_note(
+        label: str,
+        mtime: Optional[datetime.datetime],
+        ctime: Optional[datetime.datetime],
+    ) -> str:
+        """Flags a modification time that cannot be taken at face value.
+
+        A write sets both ``mtime`` and the inode's status-change time; only the
+        former can be set from userland (``cp -p``, ``touch -r``). A ``ctime``
+        well after the ``mtime`` therefore means the shown modification time was
+        carried over from an original or set deliberately, and the change time
+        is when the file really got its current content or metadata."""
+        if not mtime or not ctime or (ctime - mtime).total_seconds() <= 60:
+            return ""
+        return (
+            f"{label} changed at {ctime:%Y-%m-%d %H:%M:%S} UTC, after its "
+            "modification time (mtime preserved from an original or set deliberately)"
+        )
+
     def _generator(self):
         entries = self._collect()
 
@@ -2219,7 +2241,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             elf = entry.elf
             recovered = entry.recovered
 
-            note = entry.detection
+            notes = [entry.detection]
             if elf is not None and elf.valid:
                 functions = elf.exported if show_all else elf.interposed()
                 hooks = ", ".join(functions) if functions else nap()
@@ -2229,8 +2251,19 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                     # The library was located but its content was not recoverable
                     # from the page cache, so its exports cannot be read. Say so
                     # rather than leaving a bare "-".
-                    extra = "library content not recoverable from the page cache"
-                    note = f"{note}; {extra}" if note else extra
+                    notes.append("library content not recoverable from the page cache")
+            notes.append(
+                self._timestamp_note(
+                    "preload file", entry.preload_mtime, entry.preload_ctime
+                )
+            )
+            if recovered is not None:
+                notes.append(
+                    self._timestamp_note(
+                        "library", recovered.modification_time, recovered.change_time
+                    )
+                )
+            note = "; ".join(part for part in notes if part)
 
             yield (
                 0,
@@ -2273,6 +2306,12 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                 )
             else:
                 target = "the replacement path could not be recovered"
+            note = f"patched dynamic linker: {target} instead of /etc/ld.so.preload"
+            stamp = self._timestamp_note(
+                "loader",
+                check.recovered.modification_time,
+                check.recovered.change_time,
+            )
             yield (
                 0,
                 (
@@ -2282,13 +2321,20 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                     na(),
                     na(),
                     nap(),
-                    f"patched dynamic linker: {target} instead of /etc/ld.so.preload",
+                    f"{note}; {stamp}" if stamp else note,
                 ),
             )
 
         # Leftover patched-loader copies are reported even when their pages (and so
         # the preload path they were patched with) could not be recovered.
         for artifact in self._linker_artifacts:
+            note = (
+                "leftover copy of the dynamic linker, consistent with an in-place "
+                "patch of ld.so"
+            )
+            stamp = self._timestamp_note(
+                "copy", artifact.modification_time, artifact.change_time
+            )
             yield (
                 0,
                 (
@@ -2298,8 +2344,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                     na(),
                     na(),
                     nap(),
-                    "leftover copy of the dynamic linker, consistent with an "
-                    "in-place patch of ld.so",
+                    f"{note}; {stamp}" if stamp else note,
                 ),
             )
 
@@ -2363,8 +2408,8 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
     def run(self):
         return renderers.TreeGrid(
             [
-                ("Preload File", str),
-                ("Preload Modification Time", datetime.datetime),
+                ("File", str),
+                ("File Modification Time", datetime.datetime),
                 ("Library", str),
                 ("Library Modification Time", datetime.datetime),
                 ("Overridden Functions", str),
