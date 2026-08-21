@@ -1,0 +1,53 @@
+# Changelog
+
+All notable changes to `linux.ldpreload` are documented here. Versions follow the
+plugin's `_version` tuple.
+
+## 1.3.1 — 2026-08-20
+
+- Overridden-function matching knows the pre-glibc-2.33 export names of the `stat`
+  family (`__xstat`, `__lxstat`, `__fxstat`, `__fxstatat` and their 64-bit variants),
+  which rootkits built for enterprise Linux actually hook; added further common hook
+  targets (`fstat64`, `lstat64`, `readdir_r`, `getdents(64)`, `statx`, the `execl`
+  family, `system`, `popen`, `getpwuid`, `pam_acct_mgmt`, `pcap_next`/`pcap_dispatch`).
+- Loader-copy detection (`ld-*.so.tmp` and the like) only accepts a version suffix
+  between `.so` and the backup suffix and requires ELF content, so `ld.so.conf.bak`
+  or `ld.so.cache~` are no longer reported.
+- Renamed copies of the preload file (`/etc/ld.so.preload.bak`, `.orig`, `.rpmsave`,
+  ...) are analysed as preload files and marked as copies not read by the loader.
+
+## 1.3.0 — 2026-08-20
+
+- Dynamic-linker integrity check: every glibc loader in the page cache is read and
+  checked for its compiled-in `/etc/ld.so.preload` string. A patched loader is
+  reported with the path it reads instead, recovered exactly from a leftover copy of
+  the original when one is cached, otherwise from the loader's own strings and
+  verified against the page cache. A disguised preload file named by a patched loader
+  is confirmed by that alone.
+- Page-cache reading works on kernels whose symbol table lacks `struct page`'s
+  `mapping`/`index` fields (kABI-padded 4.18 distribution kernels): the layout is
+  derived and validated against real pages.
+- The compatibility page reader uses the XArray walker on XArray kernels.
+
+## 1.2.0 — 2026-08-20
+
+- Performance: the disguised-preload content scan inspects a candidate's first cached
+  page through raw reads and constructs framework objects only for hits; the dentry
+  walk reads each dentry once; the VMA walk reads each VMA once. Plugin runtime over
+  Volatility's own start-up dropped from ~25 s to ~1 s on a 4 GB image, with identical
+  output.
+
+## 1.1.0 — 2026-08-20
+
+- Multi-page files are readable on kABI-padded 3.10 distribution kernels, where the
+  framework cannot resolve the radix-tree node height: a compatibility walker decodes
+  it raw and self-validates the layout, so overridden-function lists are available
+  there.
+
+## 1.0.0 — 2026-08-20
+
+- Initial public release: recovery of `/etc/ld.so.preload` from the page cache,
+  library resolution (`$PLATFORM`/`$LIB`, usr-merge), `.dynsym` parsing for overridden
+  functions, process correlation with `vm_file` recovery fallback, whole-page-cache
+  content scan for disguised preload files with a confirmation gate, linker
+  tamper-artifact detection, `timeliner` integration and `--dump`.
