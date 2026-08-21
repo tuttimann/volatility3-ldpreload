@@ -3,7 +3,7 @@
 All notable changes to `linux.ldpreload` are documented here. Versions follow the
 plugin's `_version` tuple.
 
-## 1.3.1 — 2026-08-20
+## 1.3.1 (2026-08-20)
 
 - Overridden-function matching knows the pre-glibc-2.33 export names of the `stat`
   family (`__xstat`, `__lxstat`, `__fxstat`, `__fxstatat` and their 64-bit variants),
@@ -16,7 +16,7 @@ plugin's `_version` tuple.
 - Renamed copies of the preload file (`/etc/ld.so.preload.bak`, `.orig`, `.rpmsave`,
   ...) are analysed as preload files and marked as copies not read by the loader.
 
-## 1.3.0 — 2026-08-20
+## 1.3.0 (2026-08-20)
 
 - Dynamic-linker integrity check: every glibc loader in the page cache is read and
   checked for its compiled-in `/etc/ld.so.preload` string. A patched loader is
@@ -29,7 +29,7 @@ plugin's `_version` tuple.
   derived and validated against real pages.
 - The compatibility page reader uses the XArray walker on XArray kernels.
 
-## 1.2.0 — 2026-08-20
+## 1.2.0 (2026-08-20)
 
 - Performance: the disguised-preload content scan inspects a candidate's first cached
   page through raw reads and constructs framework objects only for hits; the dentry
@@ -37,14 +37,14 @@ plugin's `_version` tuple.
   Volatility's own start-up dropped from ~25 s to ~1 s on a 4 GB image, with identical
   output.
 
-## 1.1.0 — 2026-08-20
+## 1.1.0 (2026-08-20)
 
 - Multi-page files are readable on kABI-padded 3.10 distribution kernels, where the
   framework cannot resolve the radix-tree node height: a compatibility walker decodes
   it raw and self-validates the layout, so overridden-function lists are available
   there.
 
-## 1.0.0 — 2026-08-20
+## 1.0.0 (2026-08-20)
 
 - Initial public release: recovery of `/etc/ld.so.preload` from the page cache,
   library resolution (`$PLATFORM`/`$LIB`, usr-merge), `.dynsym` parsing for overridden

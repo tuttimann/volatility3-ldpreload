@@ -1,4 +1,4 @@
-# linux.ldpreload — ld.so.preload rootkit detection for Volatility 3
+# linux.ldpreload: ld.so.preload rootkit detection for Volatility 3
 
 A Volatility 3 plugin that finds **`/etc/ld.so.preload` userland rootkits** in a Linux
 memory image and explains what they do.
@@ -11,15 +11,15 @@ libprocesshider, Azazel, Jynx/Jynx2, bdvl, HiddenWasp and Symbiote, and it is ab
 a clean system.
 
 On a compromised host the usual tools are dynamically linked themselves and therefore
-lie. This plugin works from the **page cache** in the memory image — the file, the
+lie. This plugin works from the **page cache** in the memory image: the file, the
 library and the loader as the kernel holds them, which no userland hook can touch.
 
 ## Capabilities
 
 - **Recovers `/etc/ld.so.preload`** from the page cache, including copies inside
   container root filesystems and renamed backups (`ld.so.preload.bak`, `.orig`, ...).
-- **Resolves every library it names** — `$PLATFORM`/`$LIB` dynamic-string tokens and
-  `/lib` → `/usr/lib` usr-merge aliases included — and recovers the library's content
+- **Resolves every library it names**, `$PLATFORM`/`$LIB` dynamic-string tokens and
+  `/lib` → `/usr/lib` usr-merge aliases included, and recovers the library's content
   even when its directory entry is no longer cached (via the inode of a process that
   maps it).
 - **Lists the libc/PAM/pcap functions each library overrides**, parsed from the
@@ -33,7 +33,7 @@ library and the loader as the kernel holds them, which no userland hook can touc
     paths) anywhere in the page cache, with a confirmation gate that keeps the scan
     free of false positives;
   - **reads every glibc dynamic linker in the page cache and checks its compiled-in
-    preload path** — a patched loader is reported together with the path it reads
+    preload path**; a patched loader is reported together with the path it reads
     instead, recovered exactly by diffing against a leftover copy of the original or by
     elimination from the loader's own strings, verified against the page cache;
   - reports **leftover loader copies** (`ld-*.so.tmp`, `.bak`, ...) that an in-place
@@ -111,18 +111,18 @@ loader copy. Seven columns:
 | Column | Meaning |
 |---|---|
 | Preload File | Path of the preload file as cached (`/etc/ld.so.preload`, a renamed copy, or the disguised name). For linker rows: the loader's path. |
-| Preload Modification Time | Its `mtime` — when the persistence was installed or last changed. |
+| Preload Modification Time | Its `mtime`, i.e. when the persistence was installed or last changed. |
 | Library | The shared object the line names, exactly as written (tokens such as `$PLATFORM` are kept). `(dynamic linker)` / `(dynamic linker copy)` for linker rows. |
 | Library Modification Time | The recovered library's `mtime`. |
 | Overridden Functions | Global `FUNC` symbols in the library's `.dynsym` that shadow a libc/PAM/pcap function of interest (or everything, with `--all-symbols`). |
 | Mapped PIDs | Processes that currently map the library; consecutive PIDs collapsed into `first-last` ranges. |
 | Notes | How the file was found, what a patched loader reads, and anything that limits the analysis. |
 
-A classic infection — standard file, bdvl-style library name — on a RHEL 9 host:
+A classic infection (standard file, bdvl-style library name) on a RHEL 9 host:
 
 ```
 Preload File        Preload Modification Time   Library              Library Modification Time   Overridden Functions                                   Mapped PIDs                              Notes
-/etc/ld.so.preload  2026-08-14 18:13:07 UTC     /lib64/selinux.so.3  2026-08-14 18:12:53 UTC     __lxstat, __lxstat64, accept, access, execve,          1, 549, 571, 605, 607, 682, 685-691, …   N/A
+/etc/ld.so.preload  2026-08-14 18:13:07 UTC     /lib64/selinux.so.3  2026-08-14 18:12:53 UTC     __lxstat, __lxstat64, accept, access, execve,          1, 549, 571, 605, 607, 682, 685-691, ...   N/A
                                                                                                   fopen, fopen64, fstat, lstat, open, open64, openat,
                                                                                                   opendir, pam_authenticate, readdir, unlink, unlinkat
 ```
@@ -137,7 +137,7 @@ Preload File               Library                                    Overridden
 /etc/shadowrddoqnf         /bin/opensslbn/libopensslbn.so.$PLATFORM   __fxstat, __fxstat64, __lxstat,         14548        disguised preload file: the dynamic linker
                                                                       __lxstat64, __xstat, __xstat64, accept,              /usr/lib64/ld-2.17.so is patched to read it
                                                                       access, execve, execvp, fopen, fopen64,              instead of /etc/ld.so.preload
-                                                                      fstat, fstat64, fstatat, getpwnam, …
+                                                                      fstat, fstat64, fstatat, getpwnam, ...
 /usr/lib/ld-2.17.so        (dynamic linker)                           -                                       N/A          patched dynamic linker: reads /etc/shadowrddoqnf
                                                                                                                            (analysed above) instead of /etc/ld.so.preload
 /usr/lib64/ld-2.17.so      (dynamic linker)                           -                                       N/A          patched dynamic linker: reads /etc/shadowrddoqnf
@@ -168,7 +168,7 @@ preload file is present.
 ## How it works
 
 1. **Page-cache walk.** Superblocks are enumerated once per mount namespace, pseudo
-   filesystems are skipped, and every dentry is read once as raw bytes — sibling link,
+   filesystems are skipped, and every dentry is read once as raw bytes; sibling link,
    inode pointer and name come out of that one buffer. Every regular file's path and
    inode address is classified: preload file, `.so` library, glibc loader, loader copy,
    or content-scan candidate.
@@ -188,9 +188,9 @@ preload file is present.
    (`vma → vm_file → dentry`); a wanted library is recognised by inode address, and only
    a matching basename pays for full path reconstruction. A library no cached dentry
    leads to anymore is recovered from the mapping process's `vm_file` inode.
-6. **Compatibility readers.** Where the framework's page-cache reader fails — the
+6. **Compatibility readers.** Where the framework's page-cache reader fails (the
    radix-tree node height on kABI-padded 3.10 kernels, `struct page` without
-   `mapping`/`index` on 4.18 — the plugin decodes the structures raw and validates the
+   `mapping`/`index` on 4.18), the plugin decodes the structures raw and validates the
    layout against real pages before trusting it.
 
 ## Tested on
@@ -222,7 +222,7 @@ linker-patching tool and custom preload libraries, plus clean images of the same
 
 ```
 linux/ldpreload.py          the plugin (single file)
-docs/contest-submission.md  write-up: motivation and design
+docs/design.md              write-up: motivation and design
 CHANGELOG.md                version history
 ```
 
