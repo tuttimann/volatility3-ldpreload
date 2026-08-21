@@ -1,6 +1,6 @@
 # linux.ldpreload: ld.so.preload rootkit detection for Volatility 3
 
-A Volatility 3 plugin that finds **`/etc/ld.so.preload` userland rootkits** in a Linux
+A Volatility 3 plugin that finds `/etc/ld.so.preload` **userland rootkits** in a Linux
 memory image and explains what they do.
 
 `/etc/ld.so.preload` makes the dynamic loader map a shared object into *every*
