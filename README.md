@@ -43,8 +43,6 @@ library and the loader as the kernel holds them, which no userland hook can touc
 - **Runs on kernels the framework alone cannot read**: kABI-padded RHEL/CentOS 7 and 8
   kernels, whose symbol tables hide the radix-tree node height or `struct page`
   fields, are handled by a self-validating compatibility reader.
-- **Fast**: the whole page cache is walked and scanned with raw reads; the plugin adds
-  about one second to Volatility's own start-up on a 4 GB image.
 
 ## Requirements
 
