@@ -71,6 +71,17 @@ vol -p /path/to/volatility3-ldpreload -f image.lime linux.ldpreload.LdPreload
 vol -f image.lime linux.ldpreload.LdPreload
 ```
 
+> **Tip:** an infected host produces long cells (dozens of hooked functions, many PIDs,
+> multi-sentence notes). When there is a lot of output, use the pretty renderer:
+>
+> ```bash
+> vol -r pretty -f image.lime linux.ldpreload.LdPreload
+> ```
+>
+> It folds the long cells into narrow, aligned blocks so every row fits on screen. The
+> default tab-separated output keeps one line per row, which suits `grep` and pipes;
+> `-r json` is the machine-readable form.
+
 With no options the plugin does everything: recovers `/etc/ld.so.preload`, scans the
 whole page cache by content for a disguised preload file, verifies every glibc dynamic
 linker, checks for linker tamper artifacts, analyses every library and correlates it
@@ -85,14 +96,6 @@ with running processes.
 | `--skip-maps` | Do not walk process mappings (faster; `Mapped PIDs` stays empty). |
 | `--wrap N` | Fold the long cells (function lists, PID lists, notes) into lines of at most `N` characters. By default this happens only with `-r pretty`, which prints the folded cells as narrow blocks; every other renderer gets single-line cells. A value forces folding for any renderer, `0` disables it. |
 | `--dump` | Write the preload file(s), every resolved library, every patched loader and any linker artifact to the output directory (`-o`). |
-
-The output is easiest to read with the pretty renderer, where the long cells are folded
-into aligned blocks (the default tab-separated renderer and JSON/CSV keep one line per
-row):
-
-```bash
-vol -r pretty -f image.lime linux.ldpreload.LdPreload
-```
 
 Examples:
 
