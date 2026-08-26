@@ -1,7 +1,8 @@
-# linux.ldpreload: ld.so.preload rootkit detection for Volatility 3
+# linux.ldpreload: ld.so.preload and LD_PRELOAD rootkit detection for Volatility 3
 
-A Volatility 3 plugin that finds `/etc/ld.so.preload` **userland rootkits** in a Linux
-memory image and explains what they do.
+A Volatility 3 plugin that finds **userland rootkits** planted through
+`/etc/ld.so.preload` or the `LD_PRELOAD` environment variable in a Linux memory image
+and explains what they do.
 
 `/etc/ld.so.preload` makes the dynamic loader map a shared object into *every*
 dynamically linked process before libc. Any function the object exports wins over the
@@ -38,6 +39,17 @@ library and the loader as the kernel holds them, which no userland hook can touc
     elimination from the loader's own strings, verified against the page cache;
   - reports **leftover loader copies** (`ld-*.so.tmp`, `.bak`, ...) that an in-place
     patch leaves behind.
+- **Detects `LD_PRELOAD` / `LD_AUDIT` in process environments.** The same
+  interposition works per process without touching any file: export the variable once
+  and every process started from that shell inherits it. Each task's exec-time
+  environment block is read from its stack (so a later `unsetenv("LD_PRELOAD")`, which
+  only edits the pointer array, does not hide it), the named objects (absolute, bare or
+  relative) are resolved, recovered and analysed like a preload-file entry, and the row
+  says which processes carry the variable, whether they map the library, and why it is
+  suspicious (outside the system library directories, relative path, hidden, not named
+  like a shared object, overrides libc functions). Legitimate preloads (sanitisers,
+  allocators, `fakeroot`, a vendor wrapper such as the Splunk forwarder's
+  `libdlwrapper.so`) in a system library directory are shown only with `--env-all`.
 - **Feeds `timeliner`** with the modification and change times of preload files,
   libraries and patched loaders, and **extracts** all of them with `--dump`.
 - **Runs on kernels the framework alone cannot read**: kABI-padded RHEL/CentOS 7 and 8
@@ -92,6 +104,8 @@ with running processes.
 | `--path GLOB [GLOB ...]` | Additional full-path glob patterns to treat as preload files (e.g. `'*/opt/app/etc/ld.so.preload'`). |
 | `--scan-dir DIR [DIR ...]` | Restrict the disguised-preload content scan to these directories. Default: the whole page cache. |
 | `--no-scan` | Disable the content scan, the dynamic-linker integrity check and the tamper-artifact check; only `/etc/ld.so.preload` is used. |
+| `--no-env` | Do not read process environments for `LD_PRELOAD` / `LD_AUDIT`. |
+| `--env-all` | Also report `LD_PRELOAD` / `LD_AUDIT` libraries that sit in a system library directory and show no suspicious trait (or are well-known preloads such as sanitisers and allocators); by default those are suppressed as expected use. |
 | `--all-symbols` | List every exported function of each library, not only those that shadow a known libc/PAM/pcap function. |
 | `--skip-maps` | Do not walk process mappings (faster; `Mapped PIDs` stays empty). |
 | `--wrap N` | Fold the long cells (function lists, PID lists, notes) into lines of at most `N` characters. By default this happens only with `-r pretty`, which prints the folded cells as narrow blocks; every other renderer gets single-line cells. A value forces folding for any renderer, `0` disables it. |
@@ -106,6 +120,9 @@ vol -f image.lime -o out linux.ldpreload.LdPreload --dump
 # Complete export table of each library (shows the rootkit's own function names too)
 vol -f image.lime linux.ldpreload.LdPreload --all-symbols
 
+# Include the legitimate LD_PRELOAD uses (allocators, sanitisers, vendor wrappers)
+vol -f image.lime linux.ldpreload.LdPreload --env-all
+
 # Quick check of the standard file only
 vol -f image.lime linux.ldpreload.LdPreload --no-scan --skip-maps
 
@@ -118,18 +135,18 @@ vol -r json -f image.lime linux.ldpreload.LdPreload
 
 ## Output
 
-One row per preload entry, plus one row per patched dynamic linker and per leftover
-loader copy. Seven columns:
+One row per preload entry (from a preload file or from a process environment), plus one
+row per patched dynamic linker and per leftover loader copy. Seven columns:
 
 | Column | Meaning |
 |---|---|
-| File | Path of the file the row is about, as cached: the preload file (`/etc/ld.so.preload`, a renamed copy, or the disguised name), or the dynamic linker / linker copy for linker rows. |
-| File Modification Time | That file's `mtime`: when the preload file was written, or when the loader was patched. |
-| Library | The shared object the line names, exactly as written (tokens such as `$PLATFORM` are kept). `(dynamic linker)` / `(dynamic linker copy)` for linker rows. |
+| File | Path of the file the row is about, as cached: the preload file (`/etc/ld.so.preload`, a renamed copy, or the disguised name), `LD_PRELOAD (environment)` / `LD_AUDIT (environment)` for a library named by a process environment, or the dynamic linker / linker copy for linker rows. |
+| File Modification Time | That file's `mtime`: when the preload file was written, or when the loader was patched. `N/A` for an environment row. |
+| Library | The shared object the line or variable names, exactly as written (tokens such as `$PLATFORM` are kept; a bare or relative value is resolved by basename and the note says to which file). `(dynamic linker)` / `(dynamic linker copy)` for linker rows. |
 | Library Modification Time | The recovered library's `mtime`. |
 | Overridden Functions | Global `FUNC` symbols in the library's `.dynsym` that shadow a libc/PAM/pcap function of interest (or everything, with `--all-symbols`). |
 | Mapped PIDs | Processes that currently map the library; consecutive PIDs collapsed into `first-last` ranges. |
-| Notes | How the file was found, what a patched loader reads, anything that limits the analysis, and a warning when a file's change time is well after its modification time (the `mtime` was preserved from an original or set deliberately; the change time is when the file really got its content). |
+| Notes | How the file was found, which processes carry an `LD_PRELOAD` variable and why the library is suspicious, what a patched loader reads, anything that limits the analysis, and a warning when a file's change time is well after its modification time (the `mtime` was preserved from an original or set deliberately; the change time is when the file really got its content). |
 
 A classic infection (standard file, bdvl-style library name) on a RHEL 9 host:
 
@@ -208,7 +225,12 @@ preload file is present.
    (`vma → vm_file → dentry`); a wanted library is recognised by inode address, and only
    a matching basename pays for full path reconstruction. A library no cached dentry
    leads to anymore is recovered from the mapping process's `vm_file` inode.
-6. **Compatibility readers.** Where the framework's page-cache reader fails (the
+6. **Environment check.** Each task's `mm->env_start .. env_end` block is read
+   (padded, so a swapped page costs only that page) and split into `KEY=VALUE` strings;
+   `LD_PRELOAD` and `LD_AUDIT` values are split on `:` / whitespace and each object goes
+   through steps 4 and 5. A library in a system library directory with no suspicious
+   trait is suppressed unless `--env-all` is given.
+7. **Compatibility readers.** Where the framework's page-cache reader fails (the
    radix-tree node height on kABI-padded 3.10 kernels, `struct page` without
    `mapping`/`index` on 4.18), the plugin decodes the structures raw and validates the
    layout against real pages before trusting it.
@@ -221,9 +243,12 @@ preload file is present.
 | CentOS 8 | 4.18.0-305 | XArray (symbol table lacks `page.mapping`) | `vm_next` list |
 | RHEL 9 clones | 5.14.0-284 | XArray | `vm_next` list |
 | Ubuntu 24.04 | 6.8.0 | XArray | maple tree |
+| Debian 7 | 3.2.0-4 | radix tree | `vm_next` list |
 
 with libprocesshider, bdvl (standard and linker-patching configuration), a second
-linker-patching tool and custom preload libraries, plus clean images of the same hosts.
+linker-patching tool, custom preload libraries and an `LD_PRELOAD`-injected stdio
+hook, plus clean images of the same hosts. Hosts running the Splunk universal
+forwarder, which sets `LD_PRELOAD` for its own processes, produce no false positive.
 
 ## Limitations
 
@@ -235,6 +260,10 @@ linker-patching tool and custom preload libraries, plus clean images of the same
 - Physical-address translation of `struct page` in the fast paths uses the Intel
   `vmemmap` layout; on other architectures the plugin falls back to the framework's
   object-based reader (slower, same result).
+- The environment check sees the environment as `execve` wrote it. A process that
+  overwrites those bytes on its own stack, or one started with the variable stripped
+  (e.g. by a setuid transition), is not caught this way; the library rows from a preload
+  file and the process correlation are unaffected.
 - A preload library whose pages were never cached and that no process maps can be named
   but not analysed; the `Notes` column says so.
 

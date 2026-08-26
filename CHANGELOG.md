@@ -3,6 +3,25 @@
 All notable changes to `linux.ldpreload` are documented here. Versions follow the
 plugin's `_version` tuple.
 
+## 1.4.0 (2026-08-26)
+
+- New: `LD_PRELOAD` / `LD_AUDIT` detection in process environments. Each task's
+  exec-time environment block is read from its stack (a later `unsetenv` does not
+  hide it), the named objects are resolved (absolute, bare and relative values), the
+  library is recovered, parsed and correlated with the processes mapping it, and the
+  row states which processes carry the variable, whether they map the library and why
+  it is suspicious (outside the system library directories, relative path, hidden,
+  not named like a shared object, overrides libc functions). `File` shows
+  `LD_PRELOAD (environment)`; the library feeds `timeliner` and `--dump`.
+- New options: `--no-env` disables the check; `--env-all` also shows libraries in a
+  system library directory with no suspicious trait or well-known preload names
+  (sanitisers, allocators, fakeroot, vendor wrappers), which are suppressed by default.
+- The overridden-function list now also covers what credential stealers and backdoors
+  hook: the stdio family (`fwrite`, `fgets`, ...), `execv*`, socket calls, more PAM
+  and identity functions, `setuid`/`setgid`, `getenv`, `syslog`.
+- An environment-named library that overrides no known function gets its exports
+  listed in the note instead of a bare `N/A`.
+
 ## 1.3.4 (2026-08-21)
 
 - Folding of long cells now applies only when the pretty renderer consumes the output;

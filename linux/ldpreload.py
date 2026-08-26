@@ -54,6 +54,30 @@ the chosen name and location:
   ``.orig``, ...) is reported. An in-place patch of ``ld.so`` typically writes such a
   copy and renames it over the original, so it is a strong indicator on its own.
 
+Detecting ``LD_PRELOAD`` in a process environment
+--------------------------------------------------
+The same interposition works per process through the ``LD_PRELOAD`` environment
+variable (and ``LD_AUDIT``, which loads an auditing object the same way). No file is
+touched at all: the variable is exported once and every dynamically linked process
+started from that shell inherits it -- the classic way a user-level rootkit or
+credential stealer is planted without root. Each task's environment block is read
+from its stack (``mm->env_start .. env_end``) and the shared objects a
+``LD_PRELOAD``/``LD_AUDIT`` value names are resolved, recovered and analysed exactly
+like a preload file entry. The stack copy is what ``execve`` wrote: a process (or
+rootkit) that later calls ``unsetenv("LD_PRELOAD")`` only edits the ``environ``
+pointer array, so the variable still shows there while it has vanished from
+``/proc/<pid>/environ``.
+
+The row notes which processes carry the variable and whether they actually map the
+library. Preloading is also used legitimately (sanitisers, alternative allocators,
+``fakeroot``, ``libeatmydata``, a vendor's own wrapper such as the Splunk forwarder's
+``libdlwrapper.so``), so a library in a system library directory that shows no
+suspicious trait -- or that is a well-known preload library merely overriding
+allocator/libc functions -- is reported only with ``--env-all``. Everything else is
+reported, with the reasons: outside the system library directories, a relative
+path, hidden, not named like a shared object, or overriding libc functions.
+``--no-env`` disables the environment check.
+
 A library whose dentry path is no longer cached (parent dentries evicted, or the file
 unlinked after loading) is still recovered through the inode a mapping process's
 ``vm_file`` points at. Content is read through the framework's page-cache reader,
@@ -110,6 +134,7 @@ from volatility3.framework import exceptions, interfaces, renderers
 from volatility3.framework.configuration import requirements
 from volatility3.framework.constants import architectures
 from volatility3.framework.interfaces import plugins
+from volatility3.framework.objects import utility
 from volatility3.framework.symbols import linux as linux_symbols
 from volatility3.plugins import timeliner
 from volatility3.plugins.linux import pagecache, pslist
@@ -185,6 +210,47 @@ LINKER_ARTIFACT_RE = re.compile(
     r"|^ld\.so(?:\.\d+)*(?:\.tmp|\.new|\.orig|\.old|\.bak|\.swp|~)$"
 )
 
+# Environment variables that make the loader map an extra object into a process.
+# LD_PRELOAD names objects to load before libc (interposition); LD_AUDIT names
+# rtld-audit objects, which are loaded the same way and can hook symbol binding.
+PRELOAD_ENV_VARS = (b"LD_PRELOAD", b"LD_AUDIT")
+# An environment block bigger than this is not read (a smeared or unusual mm).
+ENV_AREA_MAX_SIZE = 1 << 20
+# Directories the system's own shared objects live in. A preload library anywhere
+# else (/tmp, /dev/shm, a home directory, /var/tmp, ...) is suspicious on its own.
+SYSTEM_LIB_DIRS = (
+    "/lib/",
+    "/lib32/",
+    "/lib64/",
+    "/libx32/",
+    "/usr/lib/",
+    "/usr/lib32/",
+    "/usr/lib64/",
+    "/usr/libx32/",
+    "/usr/local/lib/",
+    "/usr/local/lib64/",
+    "/opt/",
+    "/snap/",
+    "/nix/store/",
+)
+# Preload libraries that are commonly and legitimately set through LD_PRELOAD:
+# sanitisers, alternative allocators, fakeroot/faketime, libeatmydata, the
+# cwrap test wrappers, and a few desktop shims. One of these sitting in a system
+# library directory is reported only with --env-all; anywhere else it is
+# reported like any other library, since a rootkit may borrow the name.
+BENIGN_PRELOAD_RE = re.compile(
+    r"^lib(?:"
+    r"asan|tsan|ubsan|lsan|msan|hwasan|clang_rt\.[a-z_-]+"
+    r"|jemalloc|tcmalloc[\w-]*|mimalloc|dlmalloc|hoard|ltalloc"
+    r"|fakeroot(?:-\w+)?|fakechroot|faketime[\w-]*|eatmydata"
+    r"|nss_wrapper|uid_wrapper|socket_wrapper|pam_wrapper|resolv_wrapper"
+    r"|gtk3-nocsd|SegFault|pcprofile|memusage|mcheck|efence|duma|dmalloc"
+    r"|umockdev-preload|stdbuf|libsandbox|sandbox|gcc_s|pthread"
+    r"|nvidia-[\w-]+|cuda[\w-]*|gl|GL|EGL|GLX"
+    r"|xcb-glx|snoopy|coredumper|bsd"
+    r")\.so(?:\.[\w.]+)?$"
+)
+
 # Kernel-populated pseudo filesystems that cannot hold a preload file or a library:
 # nothing can create a regular file on them. Their dentry caches are large (a dentry
 # per visited /proc/<pid> entry, all of sysfs), so skipping the walk is a measurable
@@ -219,9 +285,79 @@ PSEUDO_FILESYSTEMS = frozenset(
 # original at load time. What that means is left to the analyst -- sanitisers and
 # profilers interpose the same functions as rootkits do. Before glibc 2.33 the stat
 # family was exported as __xstat/__lxstat/__fxstat/__fxstatat (and their 64-bit
-# variants), which is what a rootkit built for those systems hooks.
+# variants), which is what a rootkit built for those systems hooks. Beyond the
+# hiding primitives (directory listing, stat, open) the set covers what credential
+# stealers and backdoors interpose: stdio (a keylogger hooks fwrite/fgets), the
+# exec family, socket calls, the PAM/identity functions and the privilege calls.
 INTERPOSED_LIBC_FUNCTIONS = frozenset(
     {
+        "accept",
+        "accept4",
+        "access",
+        "bind",
+        "chdir",
+        "chmod",
+        "chown",
+        "connect",
+        "crypt",
+        "execl",
+        "execle",
+        "execlp",
+        "execv",
+        "execve",
+        "execvp",
+        "execvpe",
+        "faccessat",
+        "fchmod",
+        "fchown",
+        "fclose",
+        "fdopendir",
+        "fgetc",
+        "fgets",
+        "fprintf",
+        "fputs",
+        "fread",
+        "fts_open",
+        "fts_read",
+        "fwrite",
+        "getaddrinfo",
+        "getc",
+        "getchar",
+        "getenv",
+        "gethostbyname",
+        "getline",
+        "getspnam",
+        "ioctl",
+        "linkat",
+        "mkdir",
+        "mkdirat",
+        "mmap",
+        "nftw",
+        "pam_get_item",
+        "pam_prompt",
+        "pam_sm_authenticate",
+        "pam_vprompt",
+        "printf",
+        "puts",
+        "readdir64_r",
+        "readline",
+        "recv",
+        "recvfrom",
+        "renameat",
+        "rmdir",
+        "scandir",
+        "send",
+        "sendto",
+        "setegid",
+        "seteuid",
+        "setgid",
+        "setuid",
+        "symlink",
+        "symlinkat",
+        "syslog",
+        "tcgetattr",
+        "truncate",
+        "waitpid",
         "__fxstat",
         "__fxstat64",
         "__fxstatat",
@@ -881,13 +1017,21 @@ class PreloadEntry:
     mapped_pids: List[int] = field(default_factory=list)
     #: How this preload file was found / why it is noteworthy.
     detection: str = ""
+    #: For an entry from a process environment: the variable (LD_PRELOAD/LD_AUDIT)
+    #: and ``{pid: comm}`` of the tasks whose environment carries it.
+    env_var: str = ""
+    env_pids: Dict[int, str] = field(default_factory=dict)
+    #: Why the library is suspicious (environment entries only).
+    reasons: List[str] = field(default_factory=list)
+    #: Whether the library is a well-known legitimate preload in a system dir.
+    benign: bool = False
 
 
 class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
     """Recovers ld.so.preload from the page cache and reports the libc functions its libraries override."""
 
     _required_framework_version = (2, 0, 0)
-    _version = (1, 3, 4)
+    _version = (1, 4, 0)
 
     @classmethod
     def get_requirements(cls) -> List[interfaces.configuration.RequirementInterface]:
@@ -928,6 +1072,22 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                 description="Disable the content scan for disguised preload files, "
                 "the dynamic-linker integrity check and the tamper-artifact check; "
                 "only /etc/ld.so.preload is used",
+                default=False,
+                optional=True,
+            ),
+            requirements.BooleanRequirement(
+                name="no-env",
+                description="Do not read process environments for LD_PRELOAD / "
+                "LD_AUDIT; only preload files and the dynamic linker are checked",
+                default=False,
+                optional=True,
+            ),
+            requirements.BooleanRequirement(
+                name="env-all",
+                description="Also report LD_PRELOAD / LD_AUDIT libraries that are "
+                "well-known legitimate preloads (sanitisers, allocators, fakeroot, "
+                "...) located in a system library directory; by default those are "
+                "suppressed as expected use",
                 default=False,
                 optional=True,
             ),
@@ -1374,7 +1534,14 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                         check.verified = True
 
         self._preload_files = preload_files
-        if not preload_files:
+
+        # LD_PRELOAD / LD_AUDIT in process environments: no file is involved, so
+        # this is independent of everything above except the library index.
+        env_entries: List[PreloadEntry] = []
+        if not self.config.get("no-env", False):
+            env_entries = self._collect_env_preloads(vmlinux_module_name)
+
+        if not preload_files and not env_entries:
             for check in self._loader_checks:
                 if check.state == "patched":
                     vollog.warning(
@@ -1404,6 +1571,27 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
         # inode is read and parsed once and the result shared. None marks an inode
         # that failed the smear check, so it is not re-checked per entry.
         analysed: Dict[int, Optional[Tuple[RecoveredFile, ElfInfo]]] = {}
+
+        def analyse(entry: PreloadEntry) -> None:
+            resolved = self._lookup(entry.library, libraries)
+            if resolved is None:
+                return
+            lib_path, inode_addr = resolved
+            if inode_addr not in analysed:
+                inode = vmlinux.object("inode", offset=inode_addr, absolute=True)
+                if self._inode_usable(inode):
+                    recovered = read_inode(
+                        self.context, vmlinux_module_name, inode, lib_path
+                    )
+                    analysed[inode_addr] = (
+                        recovered,
+                        ElfReader.parse(recovered.data),
+                    )
+                else:
+                    analysed[inode_addr] = None
+            if analysed[inode_addr] is not None:
+                entry.recovered, entry.elf = analysed[inode_addr]
+
         for preload in preload_files:
             names = self._parse_preload(preload.data)
             if not names:
@@ -1440,26 +1628,12 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                     preload_ctime=preload.change_time,
                     detection=detection,
                 )
-                resolved = self._lookup(name, libraries)
-                if resolved is not None:
-                    lib_path, inode_addr = resolved
-                    if inode_addr not in analysed:
-                        inode = vmlinux.object(
-                            "inode", offset=inode_addr, absolute=True
-                        )
-                        if self._inode_usable(inode):
-                            recovered = read_inode(
-                                self.context, vmlinux_module_name, inode, lib_path
-                            )
-                            analysed[inode_addr] = (
-                                recovered,
-                                ElfReader.parse(recovered.data),
-                            )
-                        else:
-                            analysed[inode_addr] = None
-                    if analysed[inode_addr] is not None:
-                        entry.recovered, entry.elf = analysed[inode_addr]
+                analyse(entry)
                 entries.append(entry)
+
+        for entry in env_entries:
+            analyse(entry)
+            entries.append(entry)
 
         if entries and not self.config.get("skip-maps", False):
             discovered_inodes = self._correlate_processes(entries)
@@ -1527,8 +1701,146 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                     path,
                 )
 
+        if env_entries:
+            entries = self._assess_env_entries(entries)
+
         self._entries = entries
         return entries
+
+    # -- LD_PRELOAD / LD_AUDIT in process environments ---------------------------
+
+    def _read_environment(self, task) -> Optional[bytes]:
+        """The exec-time environment block of a task from its stack, or None."""
+        try:
+            mm = task.mm
+            if not (mm and mm.is_readable()):
+                return None
+            env_start = int(mm.env_start)
+            env_end = int(mm.env_end)
+        except (exceptions.InvalidAddressException, AttributeError, ValueError):
+            return None
+        size = env_end - env_start
+        if not 0 < size <= ENV_AREA_MAX_SIZE:
+            return None
+        try:
+            layer_name = task.add_process_layer()
+        except (exceptions.InvalidAddressException, AttributeError, ValueError):
+            return None
+        if layer_name is None:
+            return None
+        layer = self.context.layers[layer_name]
+        try:
+            # Padded: a swapped-out page in the middle costs that page, not the
+            # rest of the block (the variable is usually near the start anyway).
+            return layer.read(env_start, size, pad=True)
+        except exceptions.InvalidAddressException:
+            return None
+
+    @staticmethod
+    def _preload_vars(block: bytes) -> Iterator[Tuple[str, str]]:
+        """Yields ``(variable, value)`` for each LD_PRELOAD / LD_AUDIT in a block."""
+        for item in block.split(b"\x00"):
+            if not item:
+                continue
+            key, sep, value = item.partition(b"=")
+            if sep and key in PRELOAD_ENV_VARS:
+                yield key.decode("ascii"), value.decode("utf-8", "replace")
+
+    @staticmethod
+    def _split_preload_value(value: str) -> List[str]:
+        """The objects named by an LD_PRELOAD value (colon or space separated)."""
+        return [item for item in re.split(r"[:\s]+", value.strip()) if item]
+
+    def _collect_env_preloads(self, vmlinux_module_name: str) -> List[PreloadEntry]:
+        """One entry per (variable, library) found in any task's environment."""
+        found: Dict[Tuple[str, str], PreloadEntry] = {}
+        for task in self._safe_iter(
+            iter(pslist.PsList.list_tasks(self.context, vmlinux_module_name))
+        ):
+            block = self._read_environment(task)
+            if not block:
+                continue
+            hits = list(self._preload_vars(block))
+            if not hits:
+                continue
+            try:
+                pid = int(task.pid)
+                comm = utility.array_to_string(task.comm)
+            except (exceptions.InvalidAddressException, AttributeError, ValueError):
+                continue
+            for variable, value in hits:
+                for name in self._split_preload_value(value):
+                    entry = found.get((variable, name))
+                    if entry is None:
+                        entry = found[(variable, name)] = PreloadEntry(
+                            preload_path=variable, library=name, env_var=variable
+                        )
+                    entry.env_pids.setdefault(pid, comm)
+        for (variable, name), entry in found.items():
+            vollog.info(
+                "%s=%s in the environment of PID(s) %s",
+                variable,
+                name,
+                ", ".join(f"{pid} ({comm})" for pid, comm in sorted(entry.env_pids.items())),
+            )
+        return list(found.values())
+
+    def _assess_env_entries(self, entries: List[PreloadEntry]) -> List[PreloadEntry]:
+        """Decides why each environment entry is suspicious, and drops the
+        well-known legitimate preloads unless --env-all is set."""
+        show_all = self.config.get("env-all", False)
+        kept: List[PreloadEntry] = []
+        for entry in entries:
+            if not entry.env_var:
+                kept.append(entry)
+                continue
+            path = entry.recovered.path if entry.recovered else entry.library
+            expanded = self._expand_tokens(path)
+            basename = expanded.rsplit("/", 1)[-1]
+            reasons: List[str] = []
+            in_system_dir = expanded.startswith("/") and expanded.startswith(
+                SYSTEM_LIB_DIRS
+            )
+            if not entry.library.startswith("/") and "/" in entry.library:
+                # LD_PRELOAD=./build/evil.so: relative to the cwd of the shell
+                # that exported it -- the signature of a hand-run installer.
+                reasons.append("relative path")
+            if "/" in expanded and not in_system_dir:
+                reasons.append("outside the system library directories")
+            elif "/" not in expanded and entry.recovered is None:
+                reasons.append("bare name, not found in the page cache")
+            if any(
+                part.startswith(".") for part in expanded.strip("/").split("/")
+            ):
+                reasons.append("hidden file")
+            if not SO_TOKEN_RE.search(basename):
+                reasons.append("not named like a shared object")
+            interposed = entry.elf.interposed() if entry.elf and entry.elf.valid else []
+            if interposed:
+                reasons.append("overrides libc functions")
+            # A well-known preload library in a system directory is expected use;
+            # so is a vendor library in a system directory that shows none of
+            # the traits above (e.g. the Splunk forwarder's own dlopen wrapper).
+            # Either is reported only with --env-all.
+            entry.benign = in_system_dir and (
+                not reasons
+                or (
+                    reasons == ["overrides libc functions"]
+                    and bool(BENIGN_PRELOAD_RE.match(basename))
+                )
+            )
+            entry.reasons = reasons
+            if entry.benign and not show_all:
+                vollog.info(
+                    "%s=%s (PID(s) %s) is a preload library in a system directory "
+                    "with no suspicious trait; suppressed, use --env-all to show it",
+                    entry.env_var,
+                    entry.library,
+                    self._format_pids(sorted(entry.env_pids)),
+                )
+                continue
+            kept.append(entry)
+        return kept
 
     @staticmethod
     def _parse_preload(data: bytes) -> List[str]:
@@ -1928,6 +2240,19 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             for path, inode_addr in libraries.items():
                 if regex.search(path):
                     return path, inode_addr
+        if not name.startswith("/"):
+            # LD_PRELOAD=libfoo.so (searched along the library path) or a
+            # relative ./build/foo.so (relative to the exporting shell's cwd):
+            # resolved by basename, a system library directory preferred.
+            basename = name.rsplit("/", 1)[-1]
+            matches = [
+                (path, inode_addr)
+                for path, inode_addr in libraries.items()
+                if path.rsplit("/", 1)[-1] == basename
+            ]
+            if matches:
+                matches.sort(key=lambda m: (not m[0].startswith(SYSTEM_LIB_DIRS), m[0]))
+                return matches[0]
         return None
 
     @staticmethod
@@ -2154,6 +2479,10 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                             name.startswith("/")
                             and (path.endswith(name) or path.endswith(expanded))
                         )
+                        or (
+                            not name.startswith("/")
+                            and path.rsplit("/", 1)[-1] == name.rsplit("/", 1)[-1]
+                        )
                     )
                     if hit:
                         # Matched by name, so the page cache walk did not have
@@ -2197,6 +2526,35 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
         return discovered_inodes
 
     # -- output ----------------------------------------------------------------
+
+    def _env_note(self, entry: PreloadEntry) -> str:
+        """The note for a library named by LD_PRELOAD / LD_AUDIT."""
+        carriers = ", ".join(
+            f"{pid} ({comm})" for pid, comm in sorted(entry.env_pids.items())
+        )
+        parts = [f"{entry.env_var} set in the environment of PID(s) {carriers}"]
+        if entry.recovered is not None and not entry.library.startswith("/"):
+            # A bare or relative value was resolved by basename; say to what.
+            parts.append(f"resolved to {entry.recovered.path}")
+        mapped = sorted(set(entry.env_pids) & set(entry.mapped_pids))
+        if self.config.get("skip-maps", False):
+            pass
+        elif mapped and len(mapped) == len(entry.env_pids):
+            parts.append("mapped by " + ("that process" if len(mapped) == 1 else "all of them"))
+        elif mapped:
+            parts.append(f"mapped by {self._format_pids(mapped)} of them")
+        elif entry.mapped_pids:
+            parts.append("mapped by other processes only")
+        else:
+            parts.append("not mapped by any process (file missing, static binary, or unmapped)")
+        if entry.benign:
+            parts.append(
+                "preload library in a system directory with no suspicious trait "
+                "(expected use)"
+            )
+        elif entry.reasons:
+            parts.append("suspicious: " + ", ".join(entry.reasons))
+        return "; ".join(parts)
 
     @staticmethod
     def _format_pids(pids: List[int]) -> str:
@@ -2305,9 +2663,21 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             recovered = entry.recovered
 
             notes = [entry.detection]
+            if entry.env_var:
+                notes.append(self._env_note(entry))
             if elf is not None and elf.valid:
                 functions = elf.exported if show_all else elf.interposed()
                 hooks = self._wrap(", ".join(functions), 48) if functions else nap()
+                if not functions and entry.env_var and elf.exported:
+                    # A preload that overrides nothing known is still worth a
+                    # look at what it does export.
+                    shown = elf.exported[:20]
+                    more = len(elf.exported) - len(shown)
+                    notes.append(
+                        "no known libc function overridden; exports "
+                        + ", ".join(shown)
+                        + (f" (+{more} more)" if more > 0 else "")
+                    )
             else:
                 hooks = na()
                 if recovered is not None and not recovered.data:
@@ -2331,8 +2701,12 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             yield (
                 0,
                 (
-                    entry.preload_path,
-                    entry.preload_mtime or na(),
+                    (
+                        f"{entry.env_var} (environment)"
+                        if entry.env_var
+                        else entry.preload_path
+                    ),
+                    (entry.preload_mtime or na()) if not entry.env_var else nap(),
                     entry.library,
                     (recovered.modification_time if recovered else None) or na(),
                     hooks,
@@ -2418,7 +2792,8 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             self._write(preload, "ldsopreload", written)
         for entry in entries:
             if entry.recovered is not None:
-                self._write(entry.recovered, "preloadlib", written)
+                prefix = "envpreloadlib" if entry.env_var else "preloadlib"
+                self._write(entry.recovered, prefix, written)
         for artifact in self._linker_artifacts:
             self._write(artifact, "linkerartifact", written)
         for check in self._loader_checks:
@@ -2454,7 +2829,10 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             recovered = entry.recovered
             if recovered is None:
                 continue
-            description = f"ld.so.preload library {entry.library}"[:400]
+            if entry.env_var:
+                description = f"{entry.env_var} library {entry.library}"[:400]
+            else:
+                description = f"ld.so.preload library {entry.library}"[:400]
             if recovered.modification_time:
                 yield description, modified, recovered.modification_time
             if recovered.change_time:
