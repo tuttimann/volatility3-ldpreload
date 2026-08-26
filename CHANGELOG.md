@@ -3,6 +3,14 @@
 All notable changes to `linux.ldpreload` are documented here. Versions follow the
 plugin's `_version` tuple.
 
+## 1.5.0 (2026-08-26)
+
+- Every process carrying `LD_PRELOAD` / `LD_AUDIT` is now reported by default; a
+  library assumed safe (in a system library directory with no suspicious trait, or a
+  well-known preload such as a sanitiser, allocator, fakeroot or a vendor wrapper) is
+  marked so in the note. The new `--filter-safe-env` option hides those rows; it
+  replaces `--env-all`, which had the inverse default.
+
 ## 1.4.0 (2026-08-26)
 
 - New: `LD_PRELOAD` / `LD_AUDIT` detection in process environments. Each task's

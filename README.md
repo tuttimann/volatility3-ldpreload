@@ -49,7 +49,8 @@ library and the loader as the kernel holds them, which no userland hook can touc
   suspicious (outside the system library directories, relative path, hidden, not named
   like a shared object, overrides libc functions). Legitimate preloads (sanitisers,
   allocators, `fakeroot`, a vendor wrapper such as the Splunk forwarder's
-  `libdlwrapper.so`) in a system library directory are shown only with `--env-all`.
+  `libdlwrapper.so`) in a system library directory are still reported, marked as
+  assumed safe; `--filter-safe-env` hides them.
 - **Feeds `timeliner`** with the modification and change times of preload files,
   libraries and patched loaders, and **extracts** all of them with `--dump`.
 - **Runs on kernels the framework alone cannot read**: kABI-padded RHEL/CentOS 7 and 8
@@ -105,7 +106,7 @@ with running processes.
 | `--scan-dir DIR [DIR ...]` | Restrict the disguised-preload content scan to these directories. Default: the whole page cache. |
 | `--no-scan` | Disable the content scan, the dynamic-linker integrity check and the tamper-artifact check; only `/etc/ld.so.preload` is used. |
 | `--no-env` | Do not read process environments for `LD_PRELOAD` / `LD_AUDIT`. |
-| `--env-all` | Also report `LD_PRELOAD` / `LD_AUDIT` libraries that sit in a system library directory and show no suspicious trait (or are well-known preloads such as sanitisers and allocators); by default those are suppressed as expected use. |
+| `--filter-safe-env` | Hide `LD_PRELOAD` / `LD_AUDIT` libraries that are assumed safe: in a system library directory with no suspicious trait, or a well-known preload (sanitisers, allocators, fakeroot, a vendor wrapper such as the Splunk forwarder's `libdlwrapper.so`). By default every process carrying the variable is reported. |
 | `--all-symbols` | List every exported function of each library, not only those that shadow a known libc/PAM/pcap function. |
 | `--skip-maps` | Do not walk process mappings (faster; `Mapped PIDs` stays empty). |
 | `--wrap N` | Fold the long cells (function lists, PID lists, notes) into lines of at most `N` characters. By default this happens only with `-r pretty`, which prints the folded cells as narrow blocks; every other renderer gets single-line cells. A value forces folding for any renderer, `0` disables it. |
@@ -120,8 +121,8 @@ vol -f image.lime -o out linux.ldpreload.LdPreload --dump
 # Complete export table of each library (shows the rootkit's own function names too)
 vol -f image.lime linux.ldpreload.LdPreload --all-symbols
 
-# Include the legitimate LD_PRELOAD uses (allocators, sanitisers, vendor wrappers)
-vol -f image.lime linux.ldpreload.LdPreload --env-all
+# Hide the LD_PRELOAD uses assumed safe (allocators, sanitisers, vendor wrappers)
+vol -f image.lime linux.ldpreload.LdPreload --filter-safe-env
 
 # Quick check of the standard file only
 vol -f image.lime linux.ldpreload.LdPreload --no-scan --skip-maps
@@ -229,7 +230,7 @@ preload file is present.
    (padded, so a swapped page costs only that page) and split into `KEY=VALUE` strings;
    `LD_PRELOAD` and `LD_AUDIT` values are split on `:` / whitespace and each object goes
    through steps 4 and 5. A library in a system library directory with no suspicious
-   trait is suppressed unless `--env-all` is given.
+   trait is marked as assumed safe; `--filter-safe-env` hides such rows.
 7. **Compatibility readers.** Where the framework's page-cache reader fails (the
    radix-tree node height on kABI-padded 3.10 kernels, `struct page` without
    `mapping`/`index` on 4.18), the plugin decodes the structures raw and validates the

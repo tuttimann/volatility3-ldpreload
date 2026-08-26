@@ -71,12 +71,13 @@ pointer array, so the variable still shows there while it has vanished from
 The row notes which processes carry the variable and whether they actually map the
 library. Preloading is also used legitimately (sanitisers, alternative allocators,
 ``fakeroot``, ``libeatmydata``, a vendor's own wrapper such as the Splunk forwarder's
-``libdlwrapper.so``), so a library in a system library directory that shows no
-suspicious trait -- or that is a well-known preload library merely overriding
-allocator/libc functions -- is reported only with ``--env-all``. Everything else is
-reported, with the reasons: outside the system library directories, a relative
-path, hidden, not named like a shared object, or overriding libc functions.
-``--no-env`` disables the environment check.
+``libdlwrapper.so``). Every process carrying the variable is reported by default;
+a library in a system library directory that shows no suspicious trait -- or that is
+a well-known preload library merely overriding allocator/libc functions -- is marked
+as assumed safe, and ``--filter-safe-env`` hides those rows. Every other library is
+reported with the reasons: outside the system library directories, a relative path,
+hidden, not named like a shared object, or overriding libc functions. ``--no-env``
+disables the environment check.
 
 A library whose dentry path is no longer cached (parent dentries evicted, or the file
 unlinked after loading) is still recovered through the inode a mapping process's
@@ -236,7 +237,7 @@ SYSTEM_LIB_DIRS = (
 # Preload libraries that are commonly and legitimately set through LD_PRELOAD:
 # sanitisers, alternative allocators, fakeroot/faketime, libeatmydata, the
 # cwrap test wrappers, and a few desktop shims. One of these sitting in a system
-# library directory is reported only with --env-all; anywhere else it is
+# library directory is marked assumed safe (hidden by --filter-safe-env); elsewhere it is
 # reported like any other library, since a rootkit may borrow the name.
 BENIGN_PRELOAD_RE = re.compile(
     r"^lib(?:"
@@ -1031,7 +1032,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
     """Recovers ld.so.preload from the page cache and reports the libc functions its libraries override."""
 
     _required_framework_version = (2, 0, 0)
-    _version = (1, 4, 0)
+    _version = (1, 5, 0)
 
     @classmethod
     def get_requirements(cls) -> List[interfaces.configuration.RequirementInterface]:
@@ -1083,11 +1084,12 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                 optional=True,
             ),
             requirements.BooleanRequirement(
-                name="env-all",
-                description="Also report LD_PRELOAD / LD_AUDIT libraries that are "
-                "well-known legitimate preloads (sanitisers, allocators, fakeroot, "
-                "...) located in a system library directory; by default those are "
-                "suppressed as expected use",
+                name="filter-safe-env",
+                description="Hide LD_PRELOAD / LD_AUDIT libraries that are assumed "
+                "safe: located in a system library directory and showing no "
+                "suspicious trait, or a well-known preload (sanitisers, allocators, "
+                "fakeroot, a vendor wrapper such as the Splunk forwarder's); by "
+                "default every process carrying the variable is reported",
                 default=False,
                 optional=True,
             ),
@@ -1787,8 +1789,8 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
 
     def _assess_env_entries(self, entries: List[PreloadEntry]) -> List[PreloadEntry]:
         """Decides why each environment entry is suspicious, and drops the
-        well-known legitimate preloads unless --env-all is set."""
-        show_all = self.config.get("env-all", False)
+        assumed-safe ones if --filter-safe-env is set."""
+        hide_safe = self.config.get("filter-safe-env", False)
         kept: List[PreloadEntry] = []
         for entry in entries:
             if not entry.env_var:
@@ -1821,7 +1823,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             # A well-known preload library in a system directory is expected use;
             # so is a vendor library in a system directory that shows none of
             # the traits above (e.g. the Splunk forwarder's own dlopen wrapper).
-            # Either is reported only with --env-all.
+            # Either is marked as assumed safe and hidden by --filter-safe-env.
             entry.benign = in_system_dir and (
                 not reasons
                 or (
@@ -1830,10 +1832,10 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                 )
             )
             entry.reasons = reasons
-            if entry.benign and not show_all:
+            if entry.benign and hide_safe:
                 vollog.info(
                     "%s=%s (PID(s) %s) is a preload library in a system directory "
-                    "with no suspicious trait; suppressed, use --env-all to show it",
+                    "with no suspicious trait; hidden by --filter-safe-env",
                     entry.env_var,
                     entry.library,
                     self._format_pids(sorted(entry.env_pids)),
@@ -2549,8 +2551,8 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             parts.append("not mapped by any process (file missing, static binary, or unmapped)")
         if entry.benign:
             parts.append(
-                "preload library in a system directory with no suspicious trait "
-                "(expected use)"
+                "assumed safe: preload library in a system directory with no "
+                "suspicious trait (hidden by --filter-safe-env)"
             )
         elif entry.reasons:
             parts.append("suspicious: " + ", ".join(entry.reasons))
