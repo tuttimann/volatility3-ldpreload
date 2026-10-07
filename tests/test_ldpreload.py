@@ -580,16 +580,142 @@ class CollectionTests(unittest.TestCase):
 
 @unittest.skipUnless(HAVE_FRAMEWORK, "volatility3 is not importable")
 class LoaderTargetTests(unittest.TestCase):
-    def read_target(self, kernel, wanted, cached):
+    def read_target(self, kernel, wanted, cached, notes=None, read=None):
         plugin = kernel.plugin()
-        with mock.patch.object(ldpreload, "read_inode", side_effect=kernel.read):
-            return plugin._read_loader_target("kernel", wanted, cached, set())
+        # Without notes the call is the one the plugin made before the budget.
+        extra = () if notes is None else (notes,)
+        with mock.patch.object(ldpreload, "read_inode", side_effect=read or kernel.read), \
+                mock.patch.object(ldpreload, "vollog"):
+            return plugin._read_loader_target("kernel", wanted, cached, set(), *extra)
 
     def test_target_naming_ld_so_library_is_accepted(self):
         kernel = FakeKernel({5: b"/usr/lib/ld.so.evil.so\n"})
         target = self.read_target(kernel, "/etc/custom.so.1", {"/etc/custom.so.1": 5})
         self.assertIsNotNone(target)
         self.assertEqual((target.path, target.kind), ("/etc/custom.so.1", "disguised"))
+
+    def test_target_above_scan_limit_within_budget_is_read(self):
+        data = b"/lib/evil.so\n" + b"#" * (2 * ldpreload.PRELOAD_SCAN_MAX_SIZE) + b"\n"
+        kernel = FakeKernel({5: data})
+        target = self.read_target(kernel, "/etc/custom.so.1", {"/etc/custom.so.1": 5})
+        self.assertIsNotNone(target)
+
+    def test_oversized_sparse_target_is_not_read(self):
+        # A 1 TiB inode: refused on its size, before any page is read.
+        kernel = FakeKernel({5: b"/lib/evil.so\n"}, sizes={5: 1 << 40})
+        target = self.read_target(kernel, "/etc/custom.so.1", {"/etc/custom.so.1": 5})
+        self.assertIsNone(target)
+        self.assertEqual(kernel.reads, [])
+
+    def test_negative_size_target_is_not_read(self):
+        kernel = FakeKernel({5: b"/lib/evil.so\n"}, sizes={5: -1})
+        self.assertIsNone(self.read_target(kernel, "/etc/custom.so.1", {"/etc/custom.so.1": 5}))
+        self.assertEqual(kernel.reads, [])
+
+    def test_memory_error_while_reading_is_caught(self):
+        kernel = FakeKernel({5: b"/lib/evil.so\n"})
+        read = mock.Mock(side_effect=MemoryError)
+        target = self.read_target(kernel, "/etc/custom.so.1", {"/etc/custom.so.1": 5}, read=read)
+        self.assertIsNone(target)
+        read.assert_called_once()
+
+    def test_budget_and_memory_notes(self):
+        # The budget is the loader target's own, above the content scan's gate.
+        self.assertGreater(ldpreload.LOADER_TARGET_MAX_SIZE, ldpreload.PRELOAD_SCAN_MAX_SIZE)
+        cached = {"/etc/custom.so.1": 5}
+        notes = []
+        kernel = FakeKernel({5: b"/lib/evil.so\n"}, sizes={5: 1 << 40})
+        self.read_target(kernel, "/etc/custom.so.1", cached, notes)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("loader target /etc/custom.so.1 not analysed (incomplete)", notes[0])
+        self.assertIn(str(1 << 40), notes[0])
+        self.assertIn(str(ldpreload.LOADER_TARGET_MAX_SIZE), notes[0])
+        notes = []
+        kernel = FakeKernel({5: b"/lib/evil.so\n"})
+        self.read_target(kernel, "/etc/custom.so.1", cached, notes, read=mock.Mock(side_effect=MemoryError))
+        self.assertEqual(len(notes), 1)
+        self.assertIn("not analysed (incomplete): out of memory", notes[0])
+
+    def test_budget_note_reaches_the_loader_row(self):
+        loader = ldpreload.RecoveredFile(path="/usr/lib64/ld-2.17.so", inode_addr=1, data=b"")
+        check = ldpreload.LoaderCheck(loader, "patched", reads="/etc/custom.so.1", verified=True)
+        kernel = FakeKernel({5: b"/lib/evil.so\n", 6: b"\x00"}, sizes={5: 1 << 40})
+        plugin = kernel.plugin({"no-env": True, "skip-maps": True})
+        plugin.get_cached_regular_files = lambda *args: iter(
+            [("/etc/custom.so.1", 5), ("/usr/lib64/ld-2.17.so", 6)]
+        )
+        plugin._first_page_peeker = lambda *args: None
+        plugin._collect_linker_artifacts = lambda *args: None
+        plugin._check_loaders = lambda *args: [check]
+        with mock.patch.object(ldpreload, "read_inode", side_effect=kernel.read), \
+                mock.patch.object(ldpreload, "vollog"):
+            rows = list(plugin._generator())
+        self.assertEqual(kernel.reads, [])
+        (row,) = rows
+        self.assertEqual(len(row[1]), 7)
+        self.assertIn("cached but could not be analysed", row[1][6])
+        self.assertIn("loader target /etc/custom.so.1 not analysed (incomplete)", row[1][6])
+
+
+@unittest.skipUnless(HAVE_FRAMEWORK, "volatility3 is not importable")
+class BoundedReadTests(unittest.TestCase):
+    def test_bounded_buffer_refuses_to_grow(self):
+        buffer = ldpreload._BoundedBuffer(8192)
+        buffer.truncate(8192)
+        buffer.seek(4096)
+        buffer.write(b"x" * 4096)
+        self.assertEqual(len(buffer.getvalue()), 8192)
+        with self.assertRaises(ldpreload.ReadBudgetExceeded):
+            buffer.seek(1 << 40)
+        with self.assertRaises(ldpreload.ReadBudgetExceeded):
+            buffer.write(b"y")  # at 8192: one byte past the bound
+        with self.assertRaises(ldpreload.ReadBudgetExceeded):
+            buffer.truncate(1 << 40)
+        self.assertEqual(len(buffer.getvalue()), 8192)
+
+    def test_read_inode_places_nothing_beyond_i_size(self):
+        # A sparse page far past i_size is dropped without allocating up to it,
+        # whichever reader (framework or its own bound) rejects it.
+        pages = [(0, b"/lib/evil.so\n".ljust(4096, b"\x00")), (1 << 28, b"x" * 4096)]
+        inode = SimpleNamespace(
+            is_reg=True,
+            i_size=8192,
+            get_contents=lambda: iter(pages),
+            vol=SimpleNamespace(offset=0x1000),
+            get_modification_time=lambda: None,
+            get_change_time=lambda: None,
+        )
+        context = SimpleNamespace(
+            modules={"kernel": SimpleNamespace(layer_name="layer")},
+            layers={"layer": SimpleNamespace(page_size=4096)},
+        )
+        with mock.patch.object(ldpreload.pagecache, "vollog"):
+            recovered = ldpreload.read_inode(context, "kernel", inode, "/etc/x")
+        self.assertLessEqual(len(recovered.data), 8192)
+        self.assertTrue(recovered.data.startswith(b"/lib/evil.so\n"))
+
+    def test_compat_reader_places_nothing_beyond_size(self):
+        offsets = {1: 0, 2: 4096 - 100, 3: 1 << 40}
+        pages = SimpleNamespace(
+            page_size=1,  # index_of() already yields byte offsets here
+            belongs_to=lambda page, mapping: True,
+            index_of=lambda page: offsets[page],
+            content=lambda page: bytes([0x40 + page]) * 4096,
+        )
+        storage = SimpleNamespace(get_entries=lambda root: iter([1, 2, 3]))
+        inode = SimpleNamespace(i_mapping=mock.MagicMock())
+        inode.i_mapping.__int__.return_value = 0x2000
+        inode.i_mapping.dereference.return_value = SimpleNamespace(i_pages="root")
+        with mock.patch.object(ldpreload, "_page_layout", return_value=pages), \
+                mock.patch.object(
+                    ldpreload.linux_symbols.IDStorage,
+                    "choose_id_storage",
+                    return_value=storage,
+                ):
+            data = ldpreload._read_pages_compat(None, "kernel", inode, 4096)
+        # Page 2 is cut at the size, page 3 (at 1 TiB) is skipped.
+        self.assertEqual(len(data), 4096)
+        self.assertEqual(data[-100:], b"B" * 100)
 
 
 @unittest.skipUnless(HAVE_FRAMEWORK, "volatility3 is not importable")

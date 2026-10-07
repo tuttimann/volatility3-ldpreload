@@ -27,6 +27,14 @@ plugin's `_version` tuple.
   index, and a preload file or patched-loader target naming it was rejected. Only
   the exact loader-owned names (`ld.so.cache`, `ld.so.cache~`, `ld.so.conf`,
   `ld.so.conf.d`, `ld.so.preload`) are excluded now.
+- Fixed (review): the file a patched loader names was read without any size bound,
+  so a large or smeared sparse inode could make the reader allocate up to its
+  declared size (a `MemoryError` was not caught). It now has its own budget,
+  `LOADER_TARGET_MAX_SIZE` (1 MiB, above the scan's 4 KiB), checked against `i_size`
+  before any page is read. A target above it, or one whose read runs out of memory,
+  is not analysed, and the loader row's `Notes` say the analysis is incomplete. Both
+  page-cache readers (framework and compatibility) now refuse to place a page beyond
+  `i_size` before allocating for it. No new option.
 - Fixed: a well-known preload name only counts as such with a numeric version
   suffix (`libasan.so.8`, not `libasan.so.8.txt`), and `libclang_rt.asan-x86_64.so`
   is recognised.

@@ -40,7 +40,11 @@ library and the loader as the kernel holds them, which no userland hook can touc
   - reports **leftover loader copies** (`ld-*.so.tmp`, `.bak`, ...) that an in-place
     patch leaves behind;
   - analyses the file a patched loader names **whatever it is called and wherever it
-    is**, including names the content scan would not inspect on its own.
+    is**, including names the content scan would not inspect on its own. That read
+    has its own size budget, independent of the scan's 4 KiB gate: 1 MiB
+    (`LOADER_TARGET_MAX_SIZE` in the plugin, not a command-line option), checked
+    against the inode size before any page is read. A larger target is not read,
+    and `Notes` marks the analysis as incomplete.
 - **Detects `LD_PRELOAD` / `LD_AUDIT` in process environments.** The same
   interposition works per process without touching any file: export the variable once
   and every process started from that shell inherits it. Each task's exec-time
@@ -106,7 +110,7 @@ with running processes.
 | Option | Effect |
 |---|---|
 | `--path GLOB [GLOB ...]` | Additional full-path glob patterns to treat as preload files (e.g. `'*/opt/app/etc/ld.so.preload'`). |
-| `--scan-dir DIR [DIR ...]` | Restrict the disguised-preload content scan to these directories. Default: the whole page cache. |
+| `--scan-dir DIR [DIR ...]` | Restrict the disguised-preload content scan to these directories. Default: the whole page cache. The file a patched dynamic linker names is still analysed outside them (up to the 1 MiB loader-target budget). |
 | `--no-scan` | Disable the content scan, the dynamic-linker integrity check and the tamper-artifact check; only `/etc/ld.so.preload` is used. |
 | `--no-env` | Do not read process environments for `LD_PRELOAD` / `LD_AUDIT`. |
 | `--filter-safe-env` | Hide `LD_PRELOAD` / `LD_AUDIT` libraries that are assumed safe: in a system library directory with no suspicious trait, or a well-known preload (sanitisers, allocators, fakeroot, a vendor wrapper such as the Splunk forwarder's `libdlwrapper.so`). By default every process carrying the variable is reported. |

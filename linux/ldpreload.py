@@ -158,6 +158,12 @@ PRELOAD_COPY_GLOBS = ("*/etc/ld.so.preload.*",)
 # a preload file is and almost nothing else is. Being name and location
 # independent, this also catches a later run that picks a different name or path.
 PRELOAD_SCAN_MAX_SIZE = 4096  # a preload list is a few short paths; never a page+
+# The file a patched loader names is read on the loader's say-so, past the scan's
+# size gate and --scan-dir. It still has a budget of its own, checked against the
+# inode's size before any page is read: a large or smeared (sparse) inode would
+# otherwise make the reader allocate up to its declared size. A target above it is
+# reported as not analysed instead.
+LOADER_TARGET_MAX_SIZE = 1 << 20
 
 # Returned by the scan's raw first-page reader for a file it cannot decide on
 # (its page-tree head is not a direct page pointer); the caller then reads the
@@ -908,6 +914,59 @@ class _RadixTreeCompat(linux_symbols.RadixTree):
         return height
 
 
+class ReadBudgetExceeded(Exception):
+    """A page would be placed beyond the size a file read is bounded by."""
+
+
+class _BoundedBuffer(BytesIO):
+    """A ``BytesIO`` that refuses to grow past ``limit`` bytes.
+
+    The page-cache readers seek to each page's file offset and write it there,
+    so one page at a huge index of a sparse inode would make a plain ``BytesIO``
+    allocate everything before it. The offset is checked before the seek or
+    write that would allocate.
+    """
+
+    def __init__(self, limit: int) -> None:
+        super().__init__()
+        self.limit = max(limit, 0)
+
+    def _check(self, end: int) -> None:
+        if end > self.limit:
+            raise ReadBudgetExceeded(
+                f"offset {end} is beyond the {self.limit}-byte read bound"
+            )
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        if whence == 0:
+            self._check(offset)
+        elif whence == 1:
+            self._check(self.tell() + offset)
+        return super().seek(offset, whence)
+
+    def write(self, data) -> int:
+        self._check(self.tell() + len(data))
+        return super().write(data)
+
+    def truncate(self, size: Optional[int] = None) -> int:
+        if size is not None:
+            self._check(size)
+        return super().truncate(size)
+
+
+def _declared_size(inode: interfaces.objects.ObjectInterface) -> Optional[int]:
+    """The inode's ``i_size``, or None if it cannot be read."""
+    try:
+        return int(inode.i_size)
+    except (exceptions.VolatilityException, AttributeError, TypeError, ValueError):
+        return None
+
+
+def _read_buffer(size: Optional[int]) -> BytesIO:
+    """A buffer for reconstructing a file of ``size`` bytes, bounded by it."""
+    return BytesIO() if size is None else _BoundedBuffer(size)
+
+
 def _read_pages_compat(
     context: interfaces.context.ContextInterface,
     module_name: str,
@@ -937,7 +996,7 @@ def _read_pages_compat(
     else:
         trees = [storage]
     for tree in trees:
-        buffer = BytesIO()
+        buffer = _BoundedBuffer(size)
         count = 0
         try:
             for page_addr in tree.get_entries(root):
@@ -954,7 +1013,11 @@ def _read_pages_compat(
                     count += 1
                     buffer.seek(offset)
                     buffer.write(content[: size - offset])
-        except (exceptions.VolatilityException, AttributeError) as excp:
+        except (
+            exceptions.VolatilityException,
+            AttributeError,
+            ReadBudgetExceeded,
+        ) as excp:
             vollog.debug("Page walk with %s rejected: %s", type(tree).__name__, excp)
         if count:
             vollog.debug("Read %d page(s) with %s", count, type(tree).__name__)
@@ -968,14 +1031,22 @@ def read_inode(
     inode: interfaces.objects.ObjectInterface,
     path: str,
 ) -> RecoveredFile:
-    """Reads an inode's cached content, zero filling any pages that are missing."""
+    """Reads an inode's cached content, zero filling any pages that are missing.
+
+    Nothing is placed beyond the inode's ``i_size``, so the reconstruction never
+    outgrows the size a caller has checked. A caller with a byte budget checks
+    ``i_size`` against it before calling."""
     layer_name = context.modules[vmlinux_module_name].layer_name
-    buffer = BytesIO()
+    buffer = _read_buffer(_declared_size(inode))
     try:
         pagecache.InodePages.write_inode_content_to_stream(
             context, layer_name, inode, buffer
         )
-    except (exceptions.VolatilityException, AttributeError) as excp:
+    except (
+        exceptions.VolatilityException,
+        AttributeError,
+        ReadBudgetExceeded,
+    ) as excp:
         vollog.debug("Unable to read pages of %s: %s", path, excp)
         # On kABI-padded kernels (RHEL/CentOS) the framework cannot resolve the
         # radix-tree node height (3.10) or ``page.mapping`` (4.18); retry with
@@ -1031,6 +1102,8 @@ class LoaderCheck:
     verified: bool = False
     #: Unverified candidate strings when ``reads`` could not be settled.
     candidates: List[str] = field(default_factory=list)
+    #: What limited the analysis of the file ``reads`` names, for the Notes.
+    notes: List[str] = field(default_factory=list)
 
 
 # -- the plugin ------------------------------------------------------------------
@@ -1577,7 +1650,11 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                 if any(self._same_file(check.reads, p.path) for p in preload_files):
                     continue
                 target = self._read_loader_target(
-                    vmlinux_module_name, check.reads, cached_files, seen_preload_inodes
+                    vmlinux_module_name,
+                    check.reads,
+                    cached_files,
+                    seen_preload_inodes,
+                    check.notes,
                 )
                 if target is not None:
                     preload_files.append(target)
@@ -2099,17 +2176,52 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
         wanted: str,
         cached_files: Dict[str, int],
         seen_inodes: Set[int],
+        notes: Optional[List[str]] = None,
     ) -> Optional[RecoveredFile]:
         """Reads the file a patched loader names, if it is cached and has
-        preload content, as a disguised preload file."""
+        preload content, as a disguised preload file.
+
+        The read is bounded by ``LOADER_TARGET_MAX_SIZE``; a target above it, or
+        one whose read runs out of memory, is not analysed and ``notes`` says
+        so."""
         vmlinux = self.context.modules[vmlinux_module_name]
+        notes = [] if notes is None else notes
         for path, inode_addr in cached_files.items():
             if not self._same_file(wanted, path) or inode_addr in seen_inodes:
                 continue
             inode = vmlinux.object("inode", offset=inode_addr, absolute=True)
             if not self._inode_usable(inode):
                 continue
-            recovered = read_inode(self.context, vmlinux_module_name, inode, path)
+            size = _declared_size(inode)
+            if size is None or not 0 <= size <= LOADER_TARGET_MAX_SIZE:
+                vollog.warning(
+                    "%s is named by a patched loader but not read: size %s is "
+                    "outside the %d-byte loader-target budget",
+                    path,
+                    "unreadable" if size is None else size,
+                    LOADER_TARGET_MAX_SIZE,
+                )
+                notes.append(
+                    f"loader target {path} not analysed (incomplete): size "
+                    f"{'unreadable' if size is None else size} is outside the "
+                    f"{LOADER_TARGET_MAX_SIZE}-byte loader-target read budget"
+                )
+                continue
+            try:
+                recovered = read_inode(
+                    self.context, vmlinux_module_name, inode, path
+                )
+            except MemoryError:
+                vollog.warning(
+                    "%s is named by a patched loader but ran out of memory while "
+                    "being read",
+                    path,
+                )
+                notes.append(
+                    f"loader target {path} not analysed (incomplete): out of "
+                    "memory while reading it"
+                )
+                continue
             if not self._looks_like_preload(recovered.data):
                 vollog.debug(
                     "%s is named by a patched loader but has no preload content", path
@@ -2840,7 +2952,10 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                 )
             else:
                 target = "the replacement path could not be recovered"
-            note = f"patched dynamic linker: {target} instead of /etc/ld.so.preload"
+            note = "; ".join(
+                [f"patched dynamic linker: {target} instead of /etc/ld.so.preload"]
+                + check.notes
+            )
             stamp = self._timestamp_note(
                 "loader",
                 check.recovered.modification_time,
