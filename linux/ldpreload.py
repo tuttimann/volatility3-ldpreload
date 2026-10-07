@@ -165,11 +165,17 @@ PRELOAD_SCAN_MAX_SIZE = 4096  # a preload list is a few short paths; never a pag
 UNDECIDED = object()
 
 # Loader-owned /etc files that would false-match the "names a .so" test:
-# ld.so.cache lists every library on the system. ld.so.preload itself is handled
-# by the glob above; ld.so.conf(.d) names directories, not objects. They are
-# neither scan candidates nor libraries a preload line could resolve to, and a
-# token naming one of them disqualifies a file as preload content.
-SCAN_SKIP_PREFIXES = ("ld.so.",)
+# ld.so.cache lists every library on the system (ld.so.cache~ is ldconfig's
+# temporary name for it). ld.so.preload itself is handled by the glob above;
+# ld.so.conf(.d) names directories, not objects. They are neither scan
+# candidates nor libraries a preload line could resolve to, and a token naming
+# one of them disqualifies a file as preload content. Exact names only: any
+# other ld.so.* file (ld.so.evil.so) may well be a real shared object. The
+# files inside ld.so.conf.d (libc.conf, ...) are not named like libraries and
+# list directories, so the content test rejects them on its own.
+LOADER_CONFIG_NAMES = frozenset(
+    {"ld.so.cache", "ld.so.cache~", "ld.so.conf", "ld.so.conf.d", "ld.so.preload"}
+)
 
 # A token naming a shared object, allowing the ld.so dynamic-string tokens
 # ($PLATFORM/$LIB/$ORIGIN) that the loader expands at runtime.
@@ -1527,11 +1533,11 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                 # as an ordinary library and never flagged.
                 linker_artifacts.append((path, inode_addr))
             elif GLIBC_LOADER_RE.match(basename):
-                # Before the ld.so.* exclusion: the mips loader is named ld.so.1.
+                # The mips loader is named ld.so.1, so this precedes the .so test.
                 libraries.setdefault(path, inode_addr)
                 if scan:
                     loaders.setdefault(path, inode_addr)
-            elif basename.startswith(SCAN_SKIP_PREFIXES):
+            elif basename in LOADER_CONFIG_NAMES:
                 continue
             elif basename.endswith(".so") or ".so." in basename:
                 # The basename decides, so a file inside a directory whose name
@@ -1555,8 +1561,8 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                 vmlinux_module_name, loaders, cached_files
             )
             # A patched loader that names a content-scanned file confirms it. A
-            # target the scan never looked at -- named like a library, under an
-            # ld.so.* name, outside --scan-dir, or larger than a scan candidate --
+            # target the scan never looked at -- named like a library (ld.so.*
+            # included), outside --scan-dir, or larger than a scan candidate --
             # is read now on the loader's say-so: the loader is the authority on
             # what it reads.
             for check in self._loader_checks:
@@ -1933,7 +1939,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
         return all(
             token.startswith("/")
             and SO_TOKEN_RE.search(token)
-            and not token.rsplit("/", 1)[-1].startswith(SCAN_SKIP_PREFIXES)
+            and token.rsplit("/", 1)[-1] not in LOADER_CONFIG_NAMES
             for token in tokens
         )
 

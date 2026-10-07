@@ -18,6 +18,8 @@ import importlib.util
 import pathlib
 import struct
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 PLUGIN = REPO / "linux" / "ldpreload.py"
@@ -232,7 +234,15 @@ class PreloadFileTests(unittest.TestCase):
         self.assertFalse(looks(b"/usr/lib64/libc.so.6 2\n"))  # trailing flag
         self.assertFalse(looks(b"/etc/ld.so.conf.d\n"))  # a loader-owned name, never preloaded
         self.assertFalse(looks(b"/lib64/a.so\n/etc/ld.so.cache\n"))
+        self.assertFalse(looks(b"/etc/ld.so.conf\n"))
+        self.assertFalse(looks(b"/etc/ld.so.cache~\n"))
         self.assertFalse(looks(b"\x7fELF" + b"\x00" * 60))
+
+    def test_ld_so_named_library_is_preload_content(self):
+        # Only the loader's own config/cache names are excluded, not every ld.so.*.
+        looks = ldpreload.LdPreload._looks_like_preload
+        self.assertTrue(looks(b"/usr/lib/ld.so.evil.so\n"))
+        self.assertTrue(looks(b"/lib64/a.so\n/usr/lib/ld.so.x.so.1\n"))
 
     def test_split_preload_value(self):
         split = ldpreload.LdPreload._split_preload_value
@@ -482,6 +492,104 @@ class LoaderTests(unittest.TestCase):
         self.assertTrue(zero(b"x" * 4096 + b"\x00" * 4096))
         self.assertFalse(zero(b"x" * 4096 + b"\x00" * 4095))
         self.assertFalse(zero(b""))
+
+
+class FakeKernel:
+    """A stand-in for the kernel module: ``files`` maps inode address to content.
+
+    ``object("inode", offset=...)`` hands out an inode that passes the smear
+    check and reports the content's length as ``i_size`` unless ``sizes``
+    overrides it; ``read`` replaces ``read_inode``.
+    """
+
+    layer_name = "layer"
+
+    def __init__(self, files, sizes=None):
+        self.files = files
+        self.sizes = sizes or {}
+        self.reads = []
+
+    def get_type(self, name):
+        return SimpleNamespace(size=8)
+
+    def object(self, type_name, offset, absolute=False):
+        size = self.sizes.get(offset, len(self.files.get(offset, b"")))
+        return SimpleNamespace(
+            vol=SimpleNamespace(offset=offset), is_valid=lambda: True, i_size=size
+        )
+
+    def read(self, context, module_name, inode, path):
+        self.reads.append(path)
+        return ldpreload.RecoveredFile(
+            path=path, inode_addr=inode.vol.offset, data=self.files[inode.vol.offset]
+        )
+
+    def plugin(self, config=None):
+        config = {"kernel": "kernel", **(config or {})}
+        context = SimpleNamespace(modules={"kernel": self}, layers={"layer": SimpleNamespace()})
+        return make_plugin(config, _context=context)
+
+
+@unittest.skipUnless(HAVE_FRAMEWORK, "volatility3 is not importable")
+class CollectionTests(unittest.TestCase):
+    EVIL = build_elf([("readdir", STT_FUNC, STB_GLOBAL, True)])
+
+    def collect(self, kernel, cached, loader_checks=()):
+        plugin = kernel.plugin({"no-env": True, "skip-maps": True})
+        plugin.get_cached_regular_files = lambda *args: iter(cached)
+        plugin._first_page_peeker = lambda *args: None
+        plugin._collect_linker_artifacts = lambda *args: None
+        plugin._check_loaders = lambda *args: list(loader_checks)
+        with mock.patch.object(ldpreload, "read_inode", side_effect=kernel.read), \
+                mock.patch.object(ldpreload, "vollog"):
+            return plugin, plugin._collect()
+
+    def test_ld_so_named_library_is_indexed_and_analysed(self):
+        # A real shared object whose name starts with "ld.so." is a library: a
+        # disguised preload file naming it is found and the hook is read.
+        kernel = FakeKernel({1: b"/usr/lib/ld.so.evil.so\n", 2: self.EVIL, 3: b"/usr/lib\n"})
+        cached = [
+            ("/opt/.cfg/settings", 1),
+            ("/usr/lib/ld.so.evil.so", 2),
+            ("/etc/ld.so.conf", 3),
+        ]
+        _, entries = self.collect(kernel, cached)
+        self.assertEqual(
+            [(e.preload_path, e.library) for e in entries],
+            [("/opt/.cfg/settings", "/usr/lib/ld.so.evil.so")],
+        )
+        self.assertEqual(entries[0].recovered.path, "/usr/lib/ld.so.evil.so")
+        self.assertEqual(entries[0].elf.interposed(), ["readdir"])
+        # The loader's own config file is neither scanned nor indexed.
+        self.assertNotIn("/etc/ld.so.conf", kernel.reads)
+
+    def test_standard_preload_resolves_ld_so_named_library(self):
+        kernel = FakeKernel({1: b"/usr/lib/ld.so.evil.so\n", 2: self.EVIL})
+        cached = [("/etc/ld.so.preload", 1), ("/usr/lib/ld.so.evil.so", 2)]
+        _, entries = self.collect(kernel, cached)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].elf.interposed(), ["readdir"])
+
+    def test_loader_config_files_are_not_libraries(self):
+        kernel = FakeKernel({1: b"/etc/ld.so.cache\n", 2: b"\x00" * 64})
+        cached = [("/etc/ld.so.preload", 1), ("/etc/ld.so.cache", 2)]
+        _, entries = self.collect(kernel, cached)
+        self.assertEqual([e.library for e in entries], ["/etc/ld.so.cache"])
+        self.assertIsNone(entries[0].recovered)
+
+
+@unittest.skipUnless(HAVE_FRAMEWORK, "volatility3 is not importable")
+class LoaderTargetTests(unittest.TestCase):
+    def read_target(self, kernel, wanted, cached):
+        plugin = kernel.plugin()
+        with mock.patch.object(ldpreload, "read_inode", side_effect=kernel.read):
+            return plugin._read_loader_target("kernel", wanted, cached, set())
+
+    def test_target_naming_ld_so_library_is_accepted(self):
+        kernel = FakeKernel({5: b"/usr/lib/ld.so.evil.so\n"})
+        target = self.read_target(kernel, "/etc/custom.so.1", {"/etc/custom.so.1": 5})
+        self.assertIsNotNone(target)
+        self.assertEqual((target.path, target.kind), ("/etc/custom.so.1", "disguised"))
 
 
 @unittest.skipUnless(HAVE_FRAMEWORK, "volatility3 is not importable")

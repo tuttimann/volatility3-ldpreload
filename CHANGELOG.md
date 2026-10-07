@@ -22,6 +22,11 @@ plugin's `_version` tuple.
 - Fixed: `ld.so.cache` / `ld.so.conf` were indexed as libraries, so a scanned file
   naming only those could pass the confirmation gate; they are now excluded from the
   library index and from preload content.
+- Fixed (review): that exclusion matched every basename starting with `ld.so.`, so a
+  real shared object such as `/usr/lib/ld.so.evil.so` dropped out of the library
+  index, and a preload file or patched-loader target naming it was rejected. Only
+  the exact loader-owned names (`ld.so.cache`, `ld.so.cache~`, `ld.so.conf`,
+  `ld.so.conf.d`, `ld.so.preload`) are excluded now.
 - Fixed: a well-known preload name only counts as such with a numeric version
   suffix (`libasan.so.8`, not `libasan.so.8.txt`), and `libclang_rt.asan-x86_64.so`
   is recognised.
