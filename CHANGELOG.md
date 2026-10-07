@@ -62,6 +62,10 @@ plugin's `_version` tuple.
   preload parsing and content test, path resolution, environment assessment, loader
   string recovery, name patterns, rendering helpers) and a GitHub Actions workflow
   that runs it.
+- Tests (review): the section-header entry-size check is now probed directly on a
+  non-null header, so the test fails without the fix (the earlier one passed either
+  way: its first header is the null one). A loader target that lists a bare library
+  name is pinned as not analysed; that is the current, documented limitation.
 
 ## 1.5.0 (2026-08-26)
 

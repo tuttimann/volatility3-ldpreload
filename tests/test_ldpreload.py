@@ -200,6 +200,20 @@ class ElfReaderTests(unittest.TestCase):
         self.assertEqual(info.exported, [])
         self.assertIsNone(ldpreload.ElfReader.section_range(data, ".rodata"))
 
+    def test_zero_shentsize_direct_probe(self):
+        # parse() alone cannot tell: its first header is the null one, which
+        # yields nothing however often it is re-read. Aimed at the .dynstr
+        # header, an entry size of 0 would return that header once per shnum.
+        sections = ldpreload.ElfReader._sections
+        data = build_elf(self.SYMBOLS)
+        shoff = struct.unpack_from("<Q", data, 0x28)[0] + 64  # header 1: .dynstr
+        self.assertEqual(sections(data, "<", 64, shoff, 0, 2), [])
+        self.assertEqual(sections(data, "<", 64, shoff, 63, 2), [])
+        self.assertEqual(sections(data, "<", 32, shoff, 39, 2), [])
+        # The real entry size reads two distinct headers (.dynstr, .dynsym).
+        real = sections(data, "<", 64, shoff, 64, 2)
+        self.assertEqual([entry[0] for entry in real], [SHT_STRTAB, SHT_DYNSYM])
+
     def test_zero_filled_hole_is_tolerated(self):
         data = bytearray(build_elf(self.SYMBOLS))
         # Wipe the string table page: names become empty and are skipped.
@@ -676,6 +690,15 @@ class LoaderTargetTests(unittest.TestCase):
         cached = {"/a/etc/custom.so.1": 5, "/b/etc/custom.so.1": 5}
         target = self.read_target(kernel, "/etc/custom.so.1", cached)
         self.assertEqual(target.path, "/a/etc/custom.so.1")
+
+    def test_name_only_target_is_not_analysed(self):
+        # Known limitation (review F4, unchanged): a loader target still has to
+        # pass the content scan's test, which wants absolute .so paths, so a
+        # bare library name -- valid preload syntax -- is not analysed. This
+        # pins the current behaviour; changing it is a separate decision.
+        kernel = FakeKernel({5: b"libevil.so\n"})
+        self.assertIsNone(self.read_target(kernel, "/etc/custom.so.1", {"/etc/custom.so.1": 5}))
+        self.assertEqual(kernel.reads, ["/etc/custom.so.1"])
 
     def test_target_above_scan_limit_within_budget_is_read(self):
         data = b"/lib/evil.so\n" + b"#" * (2 * ldpreload.PRELOAD_SCAN_MAX_SIZE) + b"\n"
