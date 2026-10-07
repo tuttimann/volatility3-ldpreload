@@ -34,7 +34,10 @@ plugin's `_version` tuple.
   before any page is read. A target above it, or one whose read runs out of memory,
   is not analysed, and the loader row's `Notes` say the analysis is incomplete. Both
   page-cache readers (framework and compatibility) now refuse to place a page beyond
-  `i_size` before allocating for it. No new option.
+  `i_size` before allocating for it. For the loader target both are held to the
+  size checked against the budget, not to a later `i_size` read; a page outside
+  it (or at a negative offset) marks the target incomplete instead of keeping the
+  bytes read so far or retrying unbounded. No new option.
 - Fixed (review): the loader target was resolved by the first suffix match in cache
   enumeration order, so `/container/etc/x` could be read and attributed to the
   loader (`_confirmed_by`) although `/etc/x` itself was cached. An exact path now

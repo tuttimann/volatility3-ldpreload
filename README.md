@@ -44,7 +44,8 @@ library and the loader as the kernel holds them, which no userland hook can touc
     has its own size budget, independent of the scan's 4 KiB gate: 1 MiB
     (`LOADER_TARGET_MAX_SIZE` in the plugin, not a command-line option), checked
     against the inode size before any page is read. A larger target is not read,
-    and `Notes` marks the analysis as incomplete.
+    nor is one with a cached page outside that size, and `Notes` marks the
+    analysis as incomplete.
 - **Detects `LD_PRELOAD` / `LD_AUDIT` in process environments.** The same
   interposition works per process without touching any file: export the variable once
   and every process started from that shell inherits it. Each task's exec-time

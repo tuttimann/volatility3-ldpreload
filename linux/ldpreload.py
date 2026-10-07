@@ -924,7 +924,7 @@ class _BoundedBuffer(BytesIO):
     The page-cache readers seek to each page's file offset and write it there,
     so one page at a huge index of a sparse inode would make a plain ``BytesIO``
     allocate everything before it. The offset is checked before the seek or
-    write that would allocate.
+    write that would allocate; a negative position is refused the same way.
     """
 
     def __init__(self, limit: int) -> None:
@@ -932,17 +932,23 @@ class _BoundedBuffer(BytesIO):
         self.limit = max(limit, 0)
 
     def _check(self, end: int) -> None:
-        if end > self.limit:
+        if not 0 <= end <= self.limit:
             raise ReadBudgetExceeded(
-                f"offset {end} is beyond the {self.limit}-byte read bound"
+                f"offset {end} is outside the {self.limit}-byte read bound"
             )
 
     def seek(self, offset: int, whence: int = 0) -> int:
         if whence == 0:
-            self._check(offset)
+            base = 0
         elif whence == 1:
-            self._check(self.tell() + offset)
-        return super().seek(offset, whence)
+            base = self.tell()
+        elif whence == 2:
+            with self.getbuffer() as view:
+                base = view.nbytes
+        else:
+            return super().seek(offset, whence)
+        self._check(base + offset)
+        return super().seek(base + offset)
 
     def write(self, data) -> int:
         self._check(self.tell() + len(data))
@@ -972,6 +978,7 @@ def _read_pages_compat(
     module_name: str,
     inode: interfaces.objects.ObjectInterface,
     size: int,
+    strict: bool = False,
 ) -> bytes:
     """Reads an inode's cached pages without ``page`` objects.
 
@@ -982,6 +989,8 @@ def _read_pages_compat(
     nodes whose ``mapping`` does not point back. Page fields and content are
     read through ``PageLayout``, so a symbol table without ``page.mapping`` is
     no obstacle. Returns the content (missing pages zero filled), or ``b""``.
+    A page of this inode at or beyond ``size`` is skipped, or with ``strict``
+    raises ``ReadBudgetExceeded``.
     """
     pages = _page_layout(context, module_name)
     mapping_ptr = inode.i_mapping
@@ -1005,6 +1014,11 @@ def _read_pages_compat(
                         continue
                     offset = pages.index_of(page_addr) * pages.page_size
                     if offset >= size:
+                        if strict:
+                            raise ReadBudgetExceeded(
+                                f"page at offset {offset} is outside the "
+                                f"{size}-byte read bound"
+                            )
                         continue
                     content = pages.content(page_addr)
                 except exceptions.InvalidAddressException:
@@ -1018,6 +1032,8 @@ def _read_pages_compat(
             AttributeError,
             ReadBudgetExceeded,
         ) as excp:
+            if strict and isinstance(excp, ReadBudgetExceeded):
+                raise
             vollog.debug("Page walk with %s rejected: %s", type(tree).__name__, excp)
         if count:
             vollog.debug("Read %d page(s) with %s", count, type(tree).__name__)
@@ -1030,14 +1046,18 @@ def read_inode(
     vmlinux_module_name: str,
     inode: interfaces.objects.ObjectInterface,
     path: str,
+    max_size: Optional[int] = None,
 ) -> RecoveredFile:
     """Reads an inode's cached content, zero filling any pages that are missing.
 
     Nothing is placed beyond the inode's ``i_size``, so the reconstruction never
-    outgrows the size a caller has checked. A caller with a byte budget checks
-    ``i_size`` against it before calling."""
+    outgrows the size a caller has checked. A caller with a byte budget passes
+    the size it checked as ``max_size``: both readers are then held to it
+    whatever ``i_size`` reads later, and a page outside it raises
+    ``ReadBudgetExceeded`` instead of being dropped or retried."""
     layer_name = context.modules[vmlinux_module_name].layer_name
-    buffer = _read_buffer(_declared_size(inode))
+    bounded = max_size is not None
+    buffer = _read_buffer(max_size if bounded else _declared_size(inode))
     try:
         pagecache.InodePages.write_inode_content_to_stream(
             context, layer_name, inode, buffer
@@ -1047,6 +1067,8 @@ def read_inode(
         AttributeError,
         ReadBudgetExceeded,
     ) as excp:
+        if bounded and isinstance(excp, ReadBudgetExceeded):
+            raise
         vollog.debug("Unable to read pages of %s: %s", path, excp)
         # On kABI-padded kernels (RHEL/CentOS) the framework cannot resolve the
         # radix-tree node height (3.10) or ``page.mapping`` (4.18); retry with
@@ -1054,7 +1076,11 @@ def read_inode(
         # result replaces what was read so far.
         try:
             data = _read_pages_compat(
-                context, vmlinux_module_name, inode, int(inode.i_size)
+                context,
+                vmlinux_module_name,
+                inode,
+                max_size if bounded else int(inode.i_size),
+                strict=bounded,
             )
         except (exceptions.VolatilityException, AttributeError) as excp:
             vollog.debug("Compatibility page read of %s failed: %s", path, excp)
@@ -2198,9 +2224,9 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
         """Reads the file a patched loader names, if it is cached and has
         preload content, as a disguised preload file.
 
-        The read is bounded by ``LOADER_TARGET_MAX_SIZE``; a target above it, or
-        one whose read runs out of memory, is not analysed and ``notes`` says
-        so."""
+        The read is bounded by ``LOADER_TARGET_MAX_SIZE``; a target above it, one
+        with a page outside the size checked against it, or one whose read runs
+        out of memory, is not analysed and ``notes`` says so."""
         vmlinux = self.context.modules[vmlinux_module_name]
         notes = [] if notes is None else notes
         paths = self._loader_target_paths(wanted, cached_files)
@@ -2240,8 +2266,19 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                 continue
             try:
                 recovered = read_inode(
-                    self.context, vmlinux_module_name, inode, path
+                    self.context, vmlinux_module_name, inode, path, max_size=size
                 )
+            except ReadBudgetExceeded as excp:
+                vollog.warning(
+                    "%s is named by a patched loader but its read left the "
+                    "loader-target budget: %s",
+                    path,
+                    excp,
+                )
+                notes.append(
+                    f"loader target {path} not analysed (incomplete): {excp}"
+                )
+                continue
             except MemoryError:
                 vollog.warning(
                     "%s is named by a patched loader but ran out of memory while "

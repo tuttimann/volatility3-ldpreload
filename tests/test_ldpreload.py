@@ -13,6 +13,7 @@ patched-loader string recovery and the name regexes. Run with::
 level); the tests are skipped with a message otherwise.
 """
 
+import contextlib
 import datetime
 import importlib.util
 import pathlib
@@ -522,6 +523,7 @@ class FakeKernel:
         self.files = files
         self.sizes = sizes or {}
         self.reads = []
+        self.bounds = []
 
     def get_type(self, name):
         return SimpleNamespace(size=8)
@@ -532,8 +534,9 @@ class FakeKernel:
             vol=SimpleNamespace(offset=offset), is_valid=lambda: True, i_size=size
         )
 
-    def read(self, context, module_name, inode, path):
+    def read(self, context, module_name, inode, path, max_size=None):
         self.reads.append(path)
+        self.bounds.append(max_size)
         return ldpreload.RecoveredFile(
             path=path, inode_addr=inode.vol.offset, data=self.files[inode.vol.offset]
         )
@@ -705,6 +708,8 @@ class LoaderTargetTests(unittest.TestCase):
         kernel = FakeKernel({5: data})
         target = self.read_target(kernel, "/etc/custom.so.1", {"/etc/custom.so.1": 5})
         self.assertIsNotNone(target)
+        # The read is held to the size checked against the budget.
+        self.assertEqual(kernel.bounds, [len(data)])
 
     def test_oversized_sparse_target_is_not_read(self):
         # A 1 TiB inode: refused on its size, before any page is read.
@@ -822,6 +827,176 @@ class BoundedReadTests(unittest.TestCase):
         # Page 2 is cut at the size, page 3 (at 1 TiB) is skipped.
         self.assertEqual(len(data), 4096)
         self.assertEqual(data[-100:], b"B" * 100)
+
+    def test_bounded_buffer_refuses_negative_and_end_relative_positions(self):
+        buffer = ldpreload._BoundedBuffer(8)
+        buffer.write(b"abcd")
+        for offset, whence in ((-1, 0), (-5, 1), (-5, 2), (5, 2), (1 << 40, 1), (1 << 40, 2)):
+            with self.subTest(offset=offset, whence=whence):
+                with self.assertRaises(ldpreload.ReadBudgetExceeded):
+                    buffer.seek(offset, whence)
+                self.assertEqual(buffer.tell(), 4)
+        with self.assertRaises(ldpreload.ReadBudgetExceeded):
+            buffer.truncate(-1)
+        self.assertEqual(buffer.seek(4, 2), 8)
+        self.assertEqual(buffer.seek(-8, 1), 0)
+        self.assertEqual(buffer.getvalue(), b"abcd")
+
+
+def fake_inode(i_size=32):
+    return SimpleNamespace(
+        i_size=i_size,
+        is_valid=lambda: True,
+        vol=SimpleNamespace(offset=5),
+        get_modification_time=lambda: None,
+        get_change_time=lambda: None,
+    )
+
+
+def compat_pages(offsets):
+    """Patches for ``_read_pages_compat``: page ``n`` of the inode's tree sits at
+    byte offset ``offsets[n]`` and holds 4096 bytes."""
+    pages = SimpleNamespace(
+        page_size=1,
+        belongs_to=lambda page, mapping: True,
+        index_of=lambda page: offsets[page],
+        content=lambda page: b"/lib/evil.so\n".ljust(4096, b"\x00"),
+    )
+    storage = SimpleNamespace(get_entries=lambda root: iter(offsets))
+    return (
+        mock.patch.object(ldpreload, "_page_layout", return_value=pages),
+        mock.patch.object(
+            ldpreload.linux_symbols.IDStorage, "choose_id_storage", return_value=storage
+        ),
+    )
+
+
+def compat_inode(i_size=32):
+    inode = fake_inode(i_size)
+    inode.i_mapping = mock.MagicMock()
+    inode.i_mapping.__int__.return_value = 0x2000
+    inode.i_mapping.dereference.return_value = SimpleNamespace(i_pages="root")
+    return inode
+
+
+@unittest.skipUnless(HAVE_FRAMEWORK, "volatility3 is not importable")
+class LoaderTargetBoundTests(unittest.TestCase):
+    """The loader-target budget held through the real ``read_inode``, with the
+    framework's page writer and the compatibility reader mocked."""
+
+    WANTED = "/etc/target.conf"
+
+    def read_target(self, inode, write, compat=None):
+        context = SimpleNamespace(
+            modules={"kernel": SimpleNamespace(layer_name="layer", object=lambda *a, **k: inode)}
+        )
+        plugin = make_plugin(_context=context)
+        notes = []
+        patches = [
+            mock.patch.object(
+                ldpreload.pagecache.InodePages, "write_inode_content_to_stream", side_effect=write
+            ),
+            mock.patch.object(ldpreload, "vollog"),
+        ]
+        if compat is not None:
+            patches.append(mock.patch.object(ldpreload, "_read_pages_compat", compat))
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            target = plugin._read_loader_target(
+                "kernel", self.WANTED, {self.WANTED: 5}, set(), notes
+            )
+        return target, notes
+
+    def assertIncomplete(self, target, notes, reason):
+        self.assertIsNone(target)
+        self.assertEqual(len(notes), 1)
+        self.assertIn(f"loader target {self.WANTED} not analysed (incomplete)", notes[0])
+        self.assertIn(reason, notes[0])
+
+    def test_sparse_page_after_valid_content_is_incomplete(self):
+        # Valid preload bytes first, then a page at 1 TiB: the bytes read so far
+        # are not taken as the target, and nothing falls back to an unbounded read.
+        def write(context, layer, inode, stream):
+            stream.write(b"/lib/evil.so\n")
+            stream.seek(1 << 40)
+
+        compat = mock.Mock(return_value=b"/lib/evil.so\n")
+        target, notes = self.read_target(fake_inode(), write, compat)
+        self.assertIncomplete(target, notes, f"offset {1 << 40} is outside the 32-byte read bound")
+        compat.assert_not_called()
+
+    def test_negative_offset_is_incomplete(self):
+        def write(context, layer, inode, stream):
+            stream.write(b"/lib/evil.so\n")
+            stream.seek(-4096, 1)
+
+        target, notes = self.read_target(fake_inode(), write, mock.Mock())
+        self.assertIncomplete(target, notes, "offset -4083 is outside")
+
+    def test_i_size_grown_after_the_check_is_incomplete(self):
+        # The bound is the size checked against the budget, not a later i_size.
+        def write(context, layer, inode, stream):
+            inode.i_size = 1 << 40
+            stream.truncate(inode.i_size)
+
+        target, notes = self.read_target(fake_inode(), write, mock.Mock())
+        self.assertIncomplete(target, notes, "outside the 32-byte read bound")
+
+    def test_compat_reader_gets_the_checked_bound(self):
+        # An i_size unreadable by the time of the retry neither fails nor
+        # unbounds the compatibility read: it gets the checked size, strictly.
+        def write(context, layer, inode, stream):
+            del inode.i_size
+            raise AttributeError("page.mapping")
+
+        inode = fake_inode()
+        compat = mock.Mock(return_value=b"/lib/evil.so\n")
+        target, notes = self.read_target(inode, write, compat)
+        compat.assert_called_once_with(mock.ANY, "kernel", inode, 32, strict=True)
+        self.assertEqual((target.data, notes), (b"/lib/evil.so\n", []))
+
+    def test_compat_page_outside_bound_is_incomplete(self):
+        layout, storage = compat_pages({1: 0, 2: 1 << 40})
+        with layout, storage:
+            target, notes = self.read_target(
+                compat_inode(), mock.Mock(side_effect=AttributeError("page.mapping"))
+            )
+        self.assertIncomplete(target, notes, f"page at offset {1 << 40} is outside the 32-byte")
+
+    def test_memory_error_in_compat_reader_is_incomplete(self):
+        target, notes = self.read_target(
+            fake_inode(),
+            mock.Mock(side_effect=AttributeError("page.mapping")),
+            mock.Mock(side_effect=MemoryError),
+        )
+        self.assertIncomplete(target, notes, "out of memory")
+
+    def test_unbounded_read_keeps_its_fallback(self):
+        # Without max_size, read_inode behaves as before: a rejected framework
+        # read is retried by the compatibility reader with i_size, leniently.
+        def write(context, layer, inode, stream):
+            stream.write(b"/lib")
+            stream.seek(1 << 40)
+
+        inode = fake_inode()
+        context = SimpleNamespace(modules={"kernel": SimpleNamespace(layer_name="layer")})
+        compat = mock.Mock(return_value=b"/lib/evil.so\n")
+        with mock.patch.object(
+            ldpreload.pagecache.InodePages, "write_inode_content_to_stream", side_effect=write
+        ), mock.patch.object(ldpreload, "_read_pages_compat", compat), \
+                mock.patch.object(ldpreload, "vollog"):
+            recovered = ldpreload.read_inode(context, "kernel", inode, "/etc/x")
+        compat.assert_called_once_with(context, "kernel", inode, 32, strict=False)
+        self.assertEqual(recovered.data, b"/lib/evil.so\n")
+
+    def test_strict_compat_reader_raises_lenient_one_skips(self):
+        layout, storage = compat_pages({1: 0, 2: 1 << 40})
+        with layout, storage:
+            data = ldpreload._read_pages_compat(None, "kernel", compat_inode(), 32)
+            with self.assertRaises(ldpreload.ReadBudgetExceeded):
+                ldpreload._read_pages_compat(None, "kernel", compat_inode(), 32, strict=True)
+        self.assertEqual(data, b"/lib/evil.so\n".ljust(32, b"\x00"))
 
 
 @unittest.skipUnless(HAVE_FRAMEWORK, "volatility3 is not importable")
