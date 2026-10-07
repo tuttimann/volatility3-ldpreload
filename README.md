@@ -38,7 +38,14 @@ library and the loader as the kernel holds them, which no userland hook can touc
     instead, recovered exactly by diffing against a leftover copy of the original or by
     elimination from the loader's own strings, verified against the page cache;
   - reports **leftover loader copies** (`ld-*.so.tmp`, `.bak`, ...) that an in-place
-    patch leaves behind.
+    patch leaves behind;
+  - analyses the file a patched loader names **whatever it is called and wherever it
+    is**, including names the content scan would not inspect on its own. That read
+    has its own size budget, independent of the scan's 4 KiB gate: 1 MiB
+    (`LOADER_TARGET_MAX_SIZE` in the plugin, not a command-line option), checked
+    against the inode size before any page is read. A larger target is not read,
+    nor is one with a cached page outside that size, and `Notes` marks the
+    analysis as incomplete.
 - **Detects `LD_PRELOAD` / `LD_AUDIT` in process environments.** The same
   interposition works per process without touching any file: export the variable once
   and every process started from that shell inherits it. Each task's exec-time
@@ -52,14 +59,15 @@ library and the loader as the kernel holds them, which no userland hook can touc
   `libdlwrapper.so`) in a system library directory are still reported, marked as
   assumed safe; `--filter-safe-env` hides them.
 - **Feeds `timeliner`** with the modification and change times of preload files,
-  libraries and patched loaders, and **extracts** all of them with `--dump`.
+  libraries, patched loaders and leftover loader copies, and **extracts** all of them
+  with `--dump`.
 - **Runs on kernels the framework alone cannot read**: kABI-padded RHEL/CentOS 7 and 8
   kernels, whose symbol tables hide the radix-tree node height or `struct page`
   fields, are handled by a self-validating compatibility reader.
 
 ## Requirements
 
-- Volatility 3 ≥ 2.0 (developed and tested with 2.28) and a symbol table (ISF) for the
+- Volatility 3 ≥ 2.26 (developed and tested with 2.28) and a symbol table (ISF) for the
   image's kernel, as for any Linux plugin.
 - No third-party Python packages.
 
@@ -103,7 +111,7 @@ with running processes.
 | Option | Effect |
 |---|---|
 | `--path GLOB [GLOB ...]` | Additional full-path glob patterns to treat as preload files (e.g. `'*/opt/app/etc/ld.so.preload'`). |
-| `--scan-dir DIR [DIR ...]` | Restrict the disguised-preload content scan to these directories. Default: the whole page cache. |
+| `--scan-dir DIR [DIR ...]` | Restrict the disguised-preload content scan to these directories. Default: the whole page cache. The file a patched dynamic linker names is still analysed outside them (up to the 1 MiB loader-target budget). |
 | `--no-scan` | Disable the content scan, the dynamic-linker integrity check and the tamper-artifact check; only `/etc/ld.so.preload` is used. |
 | `--no-env` | Do not read process environments for `LD_PRELOAD` / `LD_AUDIT`. |
 | `--filter-safe-env` | Hide `LD_PRELOAD` / `LD_AUDIT` libraries that are assumed safe: in a system library directory with no suspicious trait, or a well-known preload (sanitisers, allocators, fakeroot, a vendor wrapper such as the Splunk forwarder's `libdlwrapper.so`). By default every process carrying the variable is reported. |
@@ -267,12 +275,29 @@ forwarder, which sets `LD_PRELOAD` for its own processes, produce no false posit
   file and the process correlation are unaffected.
 - A preload library whose pages were never cached and that no process maps can be named
   but not analysed; the `Notes` column says so.
+- Volatility 2.28's `timeliner.Timeliner` has a bug of its own: every row of its table
+  shows the timestamps of the plugin's *last* timeline item. The plugin's own `File
+  Modification Time` / `Library Modification Time` columns and `Notes` are unaffected.
+
+## Tests
+
+The image-independent code (ELF reader, preload-file parsing and content test, path
+resolution, environment assessment, patched-loader string recovery, name patterns,
+rendering helpers) has a unit-test suite that needs no memory image, only an
+importable `volatility3`:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The same suite runs in GitHub Actions on every push.
 
 ## Repository layout
 
 ```
-linux/ldpreload.py   the plugin (single file)
-CHANGELOG.md         version history
+linux/ldpreload.py        the plugin (single file)
+tests/test_ldpreload.py   unit tests (no memory image needed)
+CHANGELOG.md              version history
 ```
 
 ## License

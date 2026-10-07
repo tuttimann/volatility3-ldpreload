@@ -3,6 +3,73 @@
 All notable changes to `linux.ldpreload` are documented here. Versions follow the
 plugin's `_version` tuple.
 
+## 1.6.0 (2026-10-07)
+
+- Fixed: the string scan of a patched loader skipped every second absolute path in
+  `.rodata` (the pattern consumed the NUL terminator it then needed as the next
+  string's start). The replacement path recovered "by elimination" could be missed
+  or misattributed whenever no leftover loader copy was cached.
+- Fixed: a file the patched loader names is now analysed as a preload file whatever
+  its name or location. Before, a target named like a library (`*.so.*`), under an
+  `ld.so.*` name, outside `--scan-dir` or larger than a scan candidate was reported
+  as "cached but could not be analysed".
+- Fixed: a library named by several entries under different spellings (a preload
+  line and a bare `LD_PRELOAD` value, or `/lib` and `/usr/lib`) got its `Mapped PIDs`
+  on one of the rows only.
+- Fixed: the glibc loader pattern did not match the mips loader name `ld.so.1`.
+- Fixed: a task without an `fs_struct` (exiting) no longer marks its whole mount
+  namespace as enumerated, which could hide a container's filesystems.
+- Fixed: `ld.so.cache` / `ld.so.conf` were indexed as libraries, so a scanned file
+  naming only those could pass the confirmation gate; they are now excluded from the
+  library index and from preload content.
+- Fixed (review): that exclusion matched every basename starting with `ld.so.`, so a
+  real shared object such as `/usr/lib/ld.so.evil.so` dropped out of the library
+  index, and a preload file or patched-loader target naming it was rejected. Only
+  the exact loader-owned names (`ld.so.cache`, `ld.so.cache~`, `ld.so.conf`,
+  `ld.so.conf.d`, `ld.so.preload`) are excluded now.
+- Fixed (review): the file a patched loader names was read without any size bound,
+  so a large or smeared sparse inode could make the reader allocate up to its
+  declared size (a `MemoryError` was not caught). It now has its own budget,
+  `LOADER_TARGET_MAX_SIZE` (1 MiB, above the scan's 4 KiB), checked against `i_size`
+  before any page is read. A target above it, or one whose read runs out of memory,
+  is not analysed, and the loader row's `Notes` say the analysis is incomplete. Both
+  page-cache readers (framework and compatibility) now refuse to place a page beyond
+  `i_size` before allocating for it. For the loader target both are held to the
+  size checked against the budget, not to a later `i_size` read; a page outside
+  it (or at a negative offset) marks the target incomplete instead of keeping the
+  bytes read so far or retrying unbounded. No new option.
+- Fixed (review): the loader target was resolved by the first suffix match in cache
+  enumeration order, so `/container/etc/x` could be read and attributed to the
+  loader (`_confirmed_by`) although `/etc/x` itself was cached. An exact path now
+  always wins. When only suffix matches remain and they are several distinct files,
+  none is read or confirmed as the loader's target; the loader row's `Notes` list
+  them as ambiguous. The same rule decides which content-scanned preload files a
+  patched loader confirms.
+- Fixed: a well-known preload name only counts as such with a numeric version
+  suffix (`libasan.so.8`, not `libasan.so.8.txt`), and `libclang_rt.asan-x86_64.so`
+  is recognised.
+- A library that is named but not present in the page cache now says so in `Notes`
+  instead of showing bare `-` cells.
+- `timeliner` also receives the leftover loader copies.
+- The overridden-function list covers `dlsym`/`dlopen`, the `*_r` account lookups,
+  the utmp/wtmp functions, the remaining `stat`/`open`/`readlink` variants, the raw
+  `syscall` wrapper and `recvmsg`/`sendmsg`/`shutdown`; duplicates removed.
+- The ELF reader rejects an implausible section-header entry size instead of
+  parsing the same header 512 times.
+- Library classification uses the basename, so a file inside a directory whose name
+  contains `.so.` still reaches the content scan.
+- `_required_framework_version` is now `(2, 26, 0)`, the first release with the
+  `PsList` 4.x and `InodePages` 3.x interfaces the plugin requires; the README said
+  2.0.
+- New: a unit-test suite (`tests/`) for the image-independent code (ELF reader,
+  preload parsing and content test, path resolution, environment assessment, loader
+  string recovery, name patterns, rendering helpers) and a GitHub Actions workflow
+  that runs it.
+- Tests (review): the section-header entry-size check is now probed directly on a
+  non-null header, so the test fails without the fix (the earlier one passed either
+  way: its first header is the null one). A loader target that lists a bare library
+  name is pinned as not analysed; that is the current, documented limitation.
+
 ## 1.5.0 (2026-08-26)
 
 - Every process carrying `LD_PRELOAD` / `LD_AUDIT` is now reported by default; a
