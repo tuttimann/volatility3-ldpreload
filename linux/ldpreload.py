@@ -1104,6 +1104,11 @@ class LoaderCheck:
     candidates: List[str] = field(default_factory=list)
     #: What limited the analysis of the file ``reads`` names, for the Notes.
     notes: List[str] = field(default_factory=list)
+    #: The cached paths ``reads`` denotes: the exact path when it is cached, else
+    #: every suffix match (usr-merge, container prefix).
+    targets: List[str] = field(default_factory=list)
+    #: Whether ``targets`` are several distinct files, none attributable to it.
+    ambiguous: bool = False
 
 
 # -- the plugin ------------------------------------------------------------------
@@ -1638,16 +1643,28 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             # included), outside --scan-dir, or larger than a scan candidate --
             # is read now on the loader's say-so: the loader is the authority on
             # what it reads.
+            # Only the file the loader's string actually denotes is confirmed: the
+            # exact path wins over suffix matches, and several distinct suffix
+            # matches are reported as ambiguous rather than one picked.
             for check in self._loader_checks:
                 if check.state != "patched" or not check.reads:
                     continue
+                check.targets = self._loader_target_paths(check.reads, cached_files)
+                if len({cached_files[path] for path in check.targets}) > 1:
+                    check.ambiguous = True
+                    vollog.warning(
+                        "The patched dynamic linker %s reads %s, which matches "
+                        "several cached files (%s); none is attributed to it",
+                        check.recovered.path,
+                        check.reads,
+                        ", ".join(check.targets),
+                    )
+                    continue
                 for preload in preload_files:
-                    if preload.kind == "disguised" and self._same_file(
-                        check.reads, preload.path
-                    ):
+                    if preload.kind == "disguised" and preload.path in check.targets:
                         self._confirmed_by[preload.path] = check.recovered.path
                         check.verified = True
-                if any(self._same_file(check.reads, p.path) for p in preload_files):
+                if any(p.path in check.targets for p in preload_files):
                     continue
                 target = self._read_loader_target(
                     vmlinux_module_name,
@@ -2186,8 +2203,22 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
         so."""
         vmlinux = self.context.modules[vmlinux_module_name]
         notes = [] if notes is None else notes
-        for path, inode_addr in cached_files.items():
-            if not self._same_file(wanted, path) or inode_addr in seen_inodes:
+        paths = self._loader_target_paths(wanted, cached_files)
+        if len({cached_files[path] for path in paths}) > 1:
+            vollog.warning(
+                "%s, named by a patched loader, matches several cached files (%s); "
+                "none is read as its target",
+                wanted,
+                ", ".join(paths),
+            )
+            notes.append(
+                f"loader target {wanted} is ambiguous: it matches several cached "
+                f"files ({', '.join(paths)}); none is attributed to the loader"
+            )
+            return None
+        for path in paths:
+            inode_addr = cached_files[path]
+            if inode_addr in seen_inodes:
                 continue
             inode = vmlinux.object("inode", offset=inode_addr, absolute=True)
             if not self._inode_usable(inode):
@@ -2236,6 +2267,17 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             )
             return recovered
         return None
+
+    @classmethod
+    def _loader_target_paths(
+        cls, wanted: str, cached_files: Dict[str, int]
+    ) -> List[str]:
+        """The cached paths a patched loader's target string denotes: the exact
+        path whenever it is cached, whatever the enumeration order, else every
+        suffix match (see ``_same_file``)."""
+        if wanted in cached_files:
+            return [wanted]
+        return [path for path in cached_files if cls._same_file(wanted, path)]
 
     @staticmethod
     def _same_file(wanted: str, cached: str) -> bool:
@@ -2934,9 +2976,20 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
         for check in self._loader_checks:
             if check.state != "patched":
                 continue
-            if check.reads and any(
-                self._same_file(check.reads, path) for path in reported
-            ):
+            # The resolved targets, not any suffix match: a container's file of
+            # the same name is not what this loader reads when the exact path is
+            # cached too.
+            targets = check.targets or [
+                path
+                for path in reported
+                if check.reads and self._same_file(check.reads, path)
+            ]
+            if check.ambiguous:
+                target = (
+                    f"reads {check.reads} (ambiguous: matches the cached files "
+                    f"{', '.join(check.targets)}, none attributed to this loader)"
+                )
+            elif check.reads and any(path in reported for path in targets):
                 target = f"reads {check.reads} (analysed above)"
             elif check.reads and check.verified:
                 target = (

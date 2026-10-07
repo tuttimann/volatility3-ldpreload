@@ -570,6 +570,50 @@ class CollectionTests(unittest.TestCase):
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0].elf.interposed(), ["readdir"])
 
+    def patched_loader(self):
+        loader = ldpreload.RecoveredFile(path="/usr/lib64/ld-2.17.so", inode_addr=9, data=b"")
+        return ldpreload.LoaderCheck(loader, "patched", reads="/etc/custom.so.1", verified=True)
+
+    def scanned_targets(self, paths):
+        """Each of ``paths`` is a cached, content-scanned preload file naming
+        /lib/evil.so; returns the plugin and the loader check after _collect."""
+        files = {2: self.EVIL, 9: b"\x00"}
+        cached = [("/lib/evil.so", 2), ("/usr/lib64/ld-2.17.so", 9)]
+        for number, path in enumerate(paths, start=10):
+            files[number] = b"/lib/evil.so\n"
+            cached.append((path, number))
+        check = self.patched_loader()
+        plugin, _ = self.collect(FakeKernel(files), cached, [check])
+        return plugin, check
+
+    def test_scanned_exact_target_is_confirmed_in_either_order(self):
+        for paths in (
+            ["/container/etc/custom.so.1", "/etc/custom.so.1"],
+            ["/etc/custom.so.1", "/container/etc/custom.so.1"],
+        ):
+            with self.subTest(order=paths):
+                plugin, check = self.scanned_targets(paths)
+                self.assertEqual(plugin._confirmed_by, {"/etc/custom.so.1": "/usr/lib64/ld-2.17.so"})
+                self.assertEqual(check.targets, ["/etc/custom.so.1"])
+                self.assertFalse(check.ambiguous)
+
+    def test_scanned_suffix_targets_are_ambiguous_not_confirmed(self):
+        plugin, check = self.scanned_targets(["/a/etc/custom.so.1", "/b/etc/custom.so.1"])
+        self.assertEqual(plugin._confirmed_by, {})
+        self.assertTrue(check.ambiguous)
+        self.assertEqual(check.targets, ["/a/etc/custom.so.1", "/b/etc/custom.so.1"])
+        with mock.patch.object(ldpreload, "vollog"):
+            rows = [row for _, row in plugin._generator() if row[2] == "(dynamic linker)"]
+        (row,) = rows
+        self.assertIn("ambiguous: matches the cached files /a/etc/custom.so.1, /b/etc/custom.so.1", row[6])
+        self.assertIn("none attributed to this loader", row[6])
+        self.assertNotIn("analysed above", row[6])
+
+    def test_single_suffix_target_is_still_confirmed(self):
+        # A lone container match is still the loader's target, as before.
+        plugin, _ = self.scanned_targets(["/container/etc/custom.so.1"])
+        self.assertEqual(plugin._confirmed_by, {"/container/etc/custom.so.1": "/usr/lib64/ld-2.17.so"})
+
     def test_loader_config_files_are_not_libraries(self):
         kernel = FakeKernel({1: b"/etc/ld.so.cache\n", 2: b"\x00" * 64})
         cached = [("/etc/ld.so.preload", 1), ("/etc/ld.so.cache", 2)]
@@ -593,6 +637,45 @@ class LoaderTargetTests(unittest.TestCase):
         target = self.read_target(kernel, "/etc/custom.so.1", {"/etc/custom.so.1": 5})
         self.assertIsNotNone(target)
         self.assertEqual((target.path, target.kind), ("/etc/custom.so.1", "disguised"))
+
+    def test_exact_path_wins_in_either_enumeration_order(self):
+        kernel = FakeKernel({5: b"/lib/exact.so\n", 6: b"/lib/container.so\n"})
+        for cached in (
+            {"/container/etc/custom.so.1": 6, "/etc/custom.so.1": 5},
+            {"/etc/custom.so.1": 5, "/container/etc/custom.so.1": 6},
+        ):
+            with self.subTest(order=list(cached)):
+                target = self.read_target(kernel, "/etc/custom.so.1", cached)
+                self.assertEqual((target.path, target.data), ("/etc/custom.so.1", b"/lib/exact.so\n"))
+
+    def test_target_paths_prefer_exact(self):
+        paths = ldpreload.LdPreload._loader_target_paths
+        both = {"/container/etc/x": 6, "/etc/x": 5}
+        self.assertEqual(paths("/etc/x", both), ["/etc/x"])
+        self.assertEqual(paths("/etc/x", dict(reversed(list(both.items())))), ["/etc/x"])
+        self.assertEqual(paths("/etc/x", {"/b/etc/x": 2, "/a/etc/x": 1}), ["/b/etc/x", "/a/etc/x"])
+        self.assertEqual(paths("/etc/x", {"/etc/xy": 1}), [])
+
+    def test_several_suffix_targets_are_not_picked(self):
+        kernel = FakeKernel({5: b"/lib/a.so\n", 6: b"/lib/b.so\n"})
+        cached = {"/a/etc/custom.so.1": 5, "/b/etc/custom.so.1": 6}
+        self.assertIsNone(self.read_target(kernel, "/etc/custom.so.1", cached))
+        self.assertEqual(kernel.reads, [])
+
+    def test_ambiguity_note(self):
+        kernel = FakeKernel({5: b"/lib/a.so\n", 6: b"/lib/b.so\n"})
+        notes = []
+        cached = {"/a/etc/custom.so.1": 5, "/b/etc/custom.so.1": 6}
+        self.read_target(kernel, "/etc/custom.so.1", cached, notes)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("loader target /etc/custom.so.1 is ambiguous", notes[0])
+        self.assertIn("/a/etc/custom.so.1, /b/etc/custom.so.1", notes[0])
+
+    def test_aliases_of_one_inode_are_not_ambiguous(self):
+        kernel = FakeKernel({5: b"/lib/a.so\n"})
+        cached = {"/a/etc/custom.so.1": 5, "/b/etc/custom.so.1": 5}
+        target = self.read_target(kernel, "/etc/custom.so.1", cached)
+        self.assertEqual(target.path, "/a/etc/custom.so.1")
 
     def test_target_above_scan_limit_within_budget_is_read(self):
         data = b"/lib/evil.so\n" + b"#" * (2 * ldpreload.PRELOAD_SCAN_MAX_SIZE) + b"\n"

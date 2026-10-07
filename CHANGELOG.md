@@ -35,6 +35,13 @@ plugin's `_version` tuple.
   is not analysed, and the loader row's `Notes` say the analysis is incomplete. Both
   page-cache readers (framework and compatibility) now refuse to place a page beyond
   `i_size` before allocating for it. No new option.
+- Fixed (review): the loader target was resolved by the first suffix match in cache
+  enumeration order, so `/container/etc/x` could be read and attributed to the
+  loader (`_confirmed_by`) although `/etc/x` itself was cached. An exact path now
+  always wins. When only suffix matches remain and they are several distinct files,
+  none is read or confirmed as the loader's target; the loader row's `Notes` list
+  them as ambiguous. The same rule decides which content-scanned preload files a
+  patched loader confirms.
 - Fixed: a well-known preload name only counts as such with a numeric version
   suffix (`libasan.so.8`, not `libasan.so.8.txt`), and `libclang_rt.asan-x86_64.so`
   is recognised.
