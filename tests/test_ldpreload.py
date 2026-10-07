@@ -631,6 +631,57 @@ class CollectionTests(unittest.TestCase):
         plugin, _ = self.scanned_targets(["/container/etc/custom.so.1"])
         self.assertEqual(plugin._confirmed_by, {"/container/etc/custom.so.1": "/usr/lib64/ld-2.17.so"})
 
+    def content_scanned_targets(self, paths):
+        """As ``scanned_targets``, but the loader reads /etc/target.conf, a name
+        the content scan inspects: every one of ``paths`` is found by the scan
+        itself, and the loader-target read must not be needed."""
+        files = {2: self.EVIL, 9: b"\x00"}
+        cached = [("/lib/evil.so", 2), ("/usr/lib64/ld-2.17.so", 9)]
+        for number, path in enumerate(paths, start=10):
+            files[number] = b"/lib/evil.so\n"
+            cached.append((path, number))
+        loader = ldpreload.RecoveredFile(path="/usr/lib64/ld-2.17.so", inode_addr=9, data=b"")
+        check = ldpreload.LoaderCheck(loader, "patched", reads="/etc/target.conf", verified=False)
+        kernel = FakeKernel(files)
+        with mock.patch.object(
+            ldpreload.LdPreload, "_read_loader_target", return_value=None
+        ) as read_target:
+            plugin, _ = self.collect(kernel, cached, [check])
+        read_target.assert_not_called()
+        self.assertEqual(
+            sorted(p.path for p in plugin._preload_files if p.kind == "disguised"), sorted(paths)
+        )
+        return plugin, check
+
+    def test_content_scanned_exact_target_is_confirmed_in_either_order(self):
+        for paths in (
+            ["/container/etc/target.conf", "/etc/target.conf"],
+            ["/etc/target.conf", "/container/etc/target.conf"],
+        ):
+            with self.subTest(order=paths):
+                plugin, check = self.content_scanned_targets(paths)
+                self.assertEqual(plugin._confirmed_by, {"/etc/target.conf": "/usr/lib64/ld-2.17.so"})
+                self.assertEqual(check.targets, ["/etc/target.conf"])
+                self.assertFalse(check.ambiguous)
+                self.assertTrue(check.verified)
+
+    def test_content_scanned_suffix_targets_are_ambiguous_not_confirmed(self):
+        for paths in (
+            ["/a/etc/target.conf", "/b/etc/target.conf"],
+            ["/b/etc/target.conf", "/a/etc/target.conf"],
+        ):
+            with self.subTest(order=paths):
+                plugin, check = self.content_scanned_targets(paths)
+                self.assertEqual(plugin._confirmed_by, {})
+                self.assertTrue(check.ambiguous)
+                self.assertFalse(check.verified)
+                self.assertEqual(check.targets, paths)
+
+    def test_content_scanned_single_suffix_target_is_confirmed(self):
+        plugin, check = self.content_scanned_targets(["/container/etc/target.conf"])
+        self.assertEqual(plugin._confirmed_by, {"/container/etc/target.conf": "/usr/lib64/ld-2.17.so"})
+        self.assertTrue(check.verified)
+
     def test_loader_config_files_are_not_libraries(self):
         kernel = FakeKernel({1: b"/etc/ld.so.cache\n", 2: b"\x00" * 64})
         cached = [("/etc/ld.so.preload", 1), ("/etc/ld.so.cache", 2)]
