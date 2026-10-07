@@ -3,6 +3,46 @@
 All notable changes to `linux.ldpreload` are documented here. Versions follow the
 plugin's `_version` tuple.
 
+## 1.6.0 (2026-10-07)
+
+- Fixed: the string scan of a patched loader skipped every second absolute path in
+  `.rodata` (the pattern consumed the NUL terminator it then needed as the next
+  string's start). The replacement path recovered "by elimination" could be missed
+  or misattributed whenever no leftover loader copy was cached.
+- Fixed: a file the patched loader names is now analysed as a preload file whatever
+  its name or location. Before, a target named like a library (`*.so.*`), under an
+  `ld.so.*` name, outside `--scan-dir` or larger than a scan candidate was reported
+  as "cached but could not be analysed".
+- Fixed: a library named by several entries under different spellings (a preload
+  line and a bare `LD_PRELOAD` value, or `/lib` and `/usr/lib`) got its `Mapped PIDs`
+  on one of the rows only.
+- Fixed: the glibc loader pattern did not match the mips loader name `ld.so.1`.
+- Fixed: a task without an `fs_struct` (exiting) no longer marks its whole mount
+  namespace as enumerated, which could hide a container's filesystems.
+- Fixed: `ld.so.cache` / `ld.so.conf` were indexed as libraries, so a scanned file
+  naming only those could pass the confirmation gate; they are now excluded from the
+  library index and from preload content.
+- Fixed: a well-known preload name only counts as such with a numeric version
+  suffix (`libasan.so.8`, not `libasan.so.8.txt`), and `libclang_rt.asan-x86_64.so`
+  is recognised.
+- A library that is named but not present in the page cache now says so in `Notes`
+  instead of showing bare `-` cells.
+- `timeliner` also receives the leftover loader copies.
+- The overridden-function list covers `dlsym`/`dlopen`, the `*_r` account lookups,
+  the utmp/wtmp functions, the remaining `stat`/`open`/`readlink` variants, the raw
+  `syscall` wrapper and `recvmsg`/`sendmsg`/`shutdown`; duplicates removed.
+- The ELF reader rejects an implausible section-header entry size instead of
+  parsing the same header 512 times.
+- Library classification uses the basename, so a file inside a directory whose name
+  contains `.so.` still reaches the content scan.
+- `_required_framework_version` is now `(2, 26, 0)`, the first release with the
+  `PsList` 4.x and `InodePages` 3.x interfaces the plugin requires; the README said
+  2.0.
+- New: a unit-test suite (`tests/`) for the image-independent code (ELF reader,
+  preload parsing and content test, path resolution, environment assessment, loader
+  string recovery, name patterns, rendering helpers) and a GitHub Actions workflow
+  that runs it.
+
 ## 1.5.0 (2026-08-26)
 
 - Every process carrying `LD_PRELOAD` / `LD_AUDIT` is now reported by default; a

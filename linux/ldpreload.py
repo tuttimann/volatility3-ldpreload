@@ -20,7 +20,7 @@ to those hooks, and neither is Volatility.
 
 One row per preload entry: the preload file and its modification time, the library and
 its modification time, the libc functions the library overrides, the PIDs mapping it,
-and a note. Both timestamps also feed ``linux.timeliner``. A preload library is mapped
+and a note. Both timestamps also feed ``timeliner.Timeliner``. A preload library is mapped
 into essentially every process, so ``Mapped PIDs`` collapses consecutive PIDs into
 inclusive ``first-last`` ranges (e.g. ``1, 549, 685-691, ...``); the rendering is
 lossless. With ``-r pretty`` the long cells (function lists, PID lists, notes) are
@@ -166,7 +166,9 @@ UNDECIDED = object()
 
 # Loader-owned /etc files that would false-match the "names a .so" test:
 # ld.so.cache lists every library on the system. ld.so.preload itself is handled
-# by the glob above; ld.so.conf(.d) names directories, not objects.
+# by the glob above; ld.so.conf(.d) names directories, not objects. They are
+# neither scan candidates nor libraries a preload line could resolve to, and a
+# token naming one of them disqualifies a file as preload content.
 SCAN_SKIP_PREFIXES = ("ld.so.",)
 
 # A token naming a shared object, allowing the ld.so dynamic-string tokens
@@ -182,7 +184,7 @@ DYNAMIC_TOKEN_RE = re.compile(r"\$\{?(?:PLATFORM|LIB|ORIGIN)\}?")
 # ld-linux.so.2, ld-linux-aarch64.so.1, ld-linux-armhf.so.3, ld-2.17.so, ld64.so.1
 # (ppc64/s390x), ld.so.1 (mips). musl has no preload file, so it is not checked.
 GLIBC_LOADER_RE = re.compile(
-    r"^ld-linux[\w-]*\.so(?:\.\d+)+$|^ld-\d+\.\d+(?:\.\d+)?\.so$|^ld64?\.so(?:\.\d+)+$"
+    r"^ld-linux[\w-]*\.so(?:\.\d+)+$|^ld-\d+\.\d+(?:\.\d+)?\.so$|^ld(?:64)?\.so(?:\.\d+)+$"
 )
 # The preload path compiled into the glibc loader, and the other absolute paths a
 # stock loader carries. A replacement for the former is recovered by elimination:
@@ -202,7 +204,9 @@ LOADER_KNOWN_PATHS = frozenset(
     }
 )
 LOADER_IGNORED_PREFIXES = ("/proc/", "/dev/", "/sys/")
-LOADER_STRING_RE = re.compile(rb"\x00(/[\x21-\x7e]{1,254})\x00")
+# Lookarounds, not consumed NULs: .rodata strings sit back to back, and a
+# pattern that ate the terminator would skip every second string.
+LOADER_STRING_RE = re.compile(rb"(?<=\x00)(/[\x21-\x7e]{1,254})(?=\x00)")
 # Only a version suffix may sit between the ".so" and the junk: ld.so.conf.bak or
 # ld.so.cache~ (ldconfig's own temporary name) are ordinary files, not loader copies.
 LINKER_ARTIFACT_RE = re.compile(
@@ -241,7 +245,7 @@ SYSTEM_LIB_DIRS = (
 # reported like any other library, since a rootkit may borrow the name.
 BENIGN_PRELOAD_RE = re.compile(
     r"^lib(?:"
-    r"asan|tsan|ubsan|lsan|msan|hwasan|clang_rt\.[a-z_-]+"
+    r"asan|tsan|ubsan|lsan|msan|hwasan|clang_rt\.[\w.-]+"
     r"|jemalloc|tcmalloc[\w-]*|mimalloc|dlmalloc|hoard|ltalloc"
     r"|fakeroot(?:-\w+)?|fakechroot|faketime[\w-]*|eatmydata"
     r"|nss_wrapper|uid_wrapper|socket_wrapper|pam_wrapper|resolv_wrapper"
@@ -249,7 +253,7 @@ BENIGN_PRELOAD_RE = re.compile(
     r"|umockdev-preload|stdbuf|libsandbox|sandbox|gcc_s|pthread"
     r"|nvidia-[\w-]+|cuda[\w-]*|gl|GL|EGL|GLX"
     r"|xcb-glx|snoopy|coredumper|bsd"
-    r")\.so(?:\.[\w.]+)?$"
+    r")\.so(?:\.\d+)*$"
 )
 
 # Kernel-populated pseudo filesystems that cannot hold a preload file or a library:
@@ -292,15 +296,27 @@ PSEUDO_FILESYSTEMS = frozenset(
 # exec family, socket calls, the PAM/identity functions and the privilege calls.
 INTERPOSED_LIBC_FUNCTIONS = frozenset(
     {
+        "__fxstat",
+        "__fxstat64",
+        "__fxstatat",
+        "__fxstatat64",
+        "__lxstat",
+        "__lxstat64",
+        "__xstat",
+        "__xstat64",
         "accept",
         "accept4",
         "access",
+        "acct",
         "bind",
         "chdir",
         "chmod",
         "chown",
         "connect",
         "crypt",
+        "dlopen",
+        "dlsym",
+        "dlvsym",
         "execl",
         "execle",
         "execlp",
@@ -315,113 +331,116 @@ INTERPOSED_LIBC_FUNCTIONS = frozenset(
         "fdopendir",
         "fgetc",
         "fgets",
+        "fopen",
+        "fopen64",
+        "fork",
         "fprintf",
         "fputs",
         "fread",
+        "freopen",
+        "freopen64",
+        "fstat",
+        "fstat64",
+        "fstatat",
+        "fstatat64",
+        "fstatfs",
         "fts_open",
         "fts_read",
         "fwrite",
         "getaddrinfo",
         "getc",
         "getchar",
+        "getdents",
+        "getdents64",
         "getenv",
+        "getgrent",
+        "getgrgid",
+        "getgrnam",
         "gethostbyname",
         "getline",
+        "getpwent",
+        "getpwnam",
+        "getpwnam_r",
+        "getpwuid",
         "getspnam",
+        "getspnam_r",
+        "getutent",
+        "getutxent",
         "ioctl",
+        "kill",
+        "link",
         "linkat",
+        "listxattr",
+        "lstat",
+        "lstat64",
         "mkdir",
         "mkdirat",
         "mmap",
         "nftw",
-        "pam_get_item",
-        "pam_prompt",
-        "pam_sm_authenticate",
-        "pam_vprompt",
-        "printf",
-        "puts",
-        "readdir64_r",
-        "readline",
-        "recv",
-        "recvfrom",
-        "renameat",
-        "rmdir",
-        "scandir",
-        "send",
-        "sendto",
-        "setegid",
-        "seteuid",
-        "setgid",
-        "setuid",
-        "symlink",
-        "symlinkat",
-        "syslog",
-        "tcgetattr",
-        "truncate",
-        "waitpid",
-        "__fxstat",
-        "__fxstat64",
-        "__fxstatat",
-        "__fxstatat64",
-        "__lxstat",
-        "__lxstat64",
-        "__xstat",
-        "__xstat64",
-        "accept",
-        "access",
-        "acct",
-        "bind",
-        "connect",
-        "execl",
-        "execle",
-        "execlp",
-        "execv",
-        "execve",
-        "execvp",
-        "fopen",
-        "fopen64",
-        "fork",
-        "fstat",
-        "fstat64",
-        "fstatat",
-        "getdents",
-        "getdents64",
-        "getpwent",
-        "getpwnam",
-        "getpwuid",
-        "kill",
-        "link",
-        "listxattr",
-        "lstat",
-        "lstat64",
         "open",
         "open64",
         "openat",
+        "openat64",
         "opendir",
         "pam_acct_mgmt",
         "pam_authenticate",
+        "pam_get_item",
         "pam_open_session",
+        "pam_prompt",
+        "pam_sm_authenticate",
+        "pam_vprompt",
         "pcap_dispatch",
         "pcap_loop",
         "pcap_next",
         "pcap_next_ex",
         "pcap_stats",
         "popen",
+        "printf",
         "ptrace",
+        "puts",
+        "pututline",
+        "pututxline",
         "read",
         "readdir",
         "readdir64",
+        "readdir64_r",
         "readdir_r",
+        "readline",
         "readlink",
+        "readlinkat",
+        "recv",
+        "recvfrom",
+        "recvmsg",
         "rename",
+        "renameat",
+        "rewinddir",
+        "rmdir",
+        "scandir",
+        "send",
+        "sendmsg",
+        "sendto",
+        "setegid",
+        "seteuid",
+        "setgid",
+        "setuid",
+        "shutdown",
         "socket",
         "stat",
         "stat64",
+        "statfs",
         "statvfs",
         "statx",
+        "symlink",
+        "symlinkat",
+        "syscall",
+        "syslog",
         "system",
+        "tcgetattr",
+        "telldir",
+        "truncate",
         "unlink",
         "unlinkat",
+        "waitpid",
         "write",
     }
 )
@@ -500,6 +519,10 @@ class ElfReader:
     ) -> List[Tuple[int, int, int, int, int]]:
         """Returns (sh_type, sh_offset, sh_size, sh_link, sh_entsize) per section."""
         sections = []
+        # A corrupt entry size (0 in particular) would make every header alias the
+        # first one; the real value is fixed by the ELF class.
+        if shentsize < (64 if bits == 64 else 40):
+            return sections
         # A corrupt shnum could ask for gigabytes of parsing; the real value is small.
         for index in range(min(shnum, 512)):
             base = shoff + index * shentsize
@@ -547,6 +570,8 @@ class ElfReader:
         except struct.error:
             return None
         if not e_shoff or e_shstrndx >= e_shnum:
+            return None
+        if e_shentsize < (64 if bits == 64 else 40):
             return None
 
         def header(index: int) -> Optional[Tuple[int, int, int]]:
@@ -1031,8 +1056,8 @@ class PreloadEntry:
 class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
     """Recovers ld.so.preload from the page cache and reports the libc functions its libraries override."""
 
-    _required_framework_version = (2, 0, 0)
-    _version = (1, 5, 0)
+    _required_framework_version = (2, 26, 0)
+    _version = (1, 6, 0)
 
     @classmethod
     def get_requirements(cls) -> List[interfaces.configuration.RequirementInterface]:
@@ -1178,10 +1203,11 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                 ns_addr = int(mnt_ns)
                 if ns_addr in seen_namespaces:
                     continue
-                seen_namespaces.add(ns_addr)
                 if not (task.fs and task.fs.is_readable()):
-                    # Path reconstruction below needs the task's fs_struct.
+                    # Path reconstruction below needs the task's fs_struct; an
+                    # exiting task without one must not mark the namespace done.
                     continue
+                seen_namespaces.add(ns_addr)
                 mounts = mnt_ns.get_mount_points()
             except (exceptions.InvalidAddressException, AttributeError):
                 continue
@@ -1475,13 +1501,14 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
         scan_candidates: List[Tuple[str, int]] = []  # (path, inode) files to inspect
         linker_artifacts: List[Tuple[str, int]] = []
         loaders: Dict[str, int] = {}  # glibc dynamic linkers, path -> inode
-        cached_paths: Set[str] = set()  # every regular file, for cross-checks
+        cached_files: Dict[str, int] = {}  # every regular file, for cross-checks
 
         for path, inode_addr in self.get_cached_regular_files(
             self.context, vmlinux_module_name
         ):
+            basename = path.rsplit("/", 1)[-1]
             if scan:
-                cached_paths.add(path)
+                cached_files.setdefault(path, inode_addr)
             if glob_match(path):
                 if inode_addr in seen_preload_inodes:
                     continue
@@ -1494,23 +1521,26 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                     if copy_match(path):
                         recovered.kind = "copy"
                     preload_files.append(recovered)
-            elif scan and LINKER_ARTIFACT_RE.match(path.rsplit("/", 1)[-1]):
+            elif scan and LINKER_ARTIFACT_RE.match(basename):
                 # Checked before the .so test: a linker artifact such as
                 # ld-2.17.so.tmp contains ".so." and would otherwise be filed away
                 # as an ordinary library and never flagged.
                 linker_artifacts.append((path, inode_addr))
-            elif path.endswith(".so") or ".so." in path:
-                # Keep the first inode seen for a path; duplicates across mount
-                # namespaces are resolved by exact path below. Whether it is intact
-                # is checked only if a preload entry resolves to it.
+            elif GLIBC_LOADER_RE.match(basename):
+                # Before the ld.so.* exclusion: the mips loader is named ld.so.1.
                 libraries.setdefault(path, inode_addr)
-                if scan and GLIBC_LOADER_RE.match(path.rsplit("/", 1)[-1]):
+                if scan:
                     loaders.setdefault(path, inode_addr)
-            elif (
-                scan
-                and in_scan_scope(path)
-                and (not path.rsplit("/", 1)[-1].startswith(SCAN_SKIP_PREFIXES))
-            ):
+            elif basename.startswith(SCAN_SKIP_PREFIXES):
+                continue
+            elif basename.endswith(".so") or ".so." in basename:
+                # The basename decides, so a file inside a directory whose name
+                # merely contains ".so." still reaches the content scan. Keep the
+                # first inode seen for a path; duplicates across mount namespaces
+                # are resolved by exact path below. Whether it is intact is
+                # checked only if a preload entry resolves to it.
+                libraries.setdefault(path, inode_addr)
+            elif scan and in_scan_scope(path):
                 scan_candidates.append((path, inode_addr))
 
         if scan:
@@ -1522,9 +1552,13 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             )
             self._collect_linker_artifacts(vmlinux_module_name, linker_artifacts)
             self._loader_checks = self._check_loaders(
-                vmlinux_module_name, loaders, cached_paths
+                vmlinux_module_name, loaders, cached_files
             )
-            # A patched loader that names a content-scanned file confirms it.
+            # A patched loader that names a content-scanned file confirms it. A
+            # target the scan never looked at -- named like a library, under an
+            # ld.so.* name, outside --scan-dir, or larger than a scan candidate --
+            # is read now on the loader's say-so: the loader is the authority on
+            # what it reads.
             for check in self._loader_checks:
                 if check.state != "patched" or not check.reads:
                     continue
@@ -1534,6 +1568,15 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                     ):
                         self._confirmed_by[preload.path] = check.recovered.path
                         check.verified = True
+                if any(self._same_file(check.reads, p.path) for p in preload_files):
+                    continue
+                target = self._read_loader_target(
+                    vmlinux_module_name, check.reads, cached_files, seen_preload_inodes
+                )
+                if target is not None:
+                    preload_files.append(target)
+                    self._confirmed_by[target.path] = check.recovered.path
+                    check.verified = True
 
         self._preload_files = preload_files
 
@@ -1560,7 +1603,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                     "preload file whose pages are not cached.",
                     ", ".join(a.path for a in self._linker_artifacts),
                 )
-            else:
+            elif not any(c.state == "patched" for c in self._loader_checks):
                 vollog.info(
                     "No ld.so.preload file present in the page cache. This is the "
                     "expected state for a clean system."
@@ -1888,7 +1931,10 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
         if not tokens:
             return False
         return all(
-            token.startswith("/") and SO_TOKEN_RE.search(token) for token in tokens
+            token.startswith("/")
+            and SO_TOKEN_RE.search(token)
+            and not token.rsplit("/", 1)[-1].startswith(SCAN_SKIP_PREFIXES)
+            for token in tokens
         )
 
     def _scan_disguised_preloads(
@@ -2041,6 +2087,38 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
 
         return peek
 
+    def _read_loader_target(
+        self,
+        vmlinux_module_name: str,
+        wanted: str,
+        cached_files: Dict[str, int],
+        seen_inodes: Set[int],
+    ) -> Optional[RecoveredFile]:
+        """Reads the file a patched loader names, if it is cached and has
+        preload content, as a disguised preload file."""
+        vmlinux = self.context.modules[vmlinux_module_name]
+        for path, inode_addr in cached_files.items():
+            if not self._same_file(wanted, path) or inode_addr in seen_inodes:
+                continue
+            inode = vmlinux.object("inode", offset=inode_addr, absolute=True)
+            if not self._inode_usable(inode):
+                continue
+            recovered = read_inode(self.context, vmlinux_module_name, inode, path)
+            if not self._looks_like_preload(recovered.data):
+                vollog.debug(
+                    "%s is named by a patched loader but has no preload content", path
+                )
+                continue
+            seen_inodes.add(inode_addr)
+            recovered.kind = "disguised"
+            vollog.info(
+                "%s was not a content-scan candidate; read it because a patched "
+                "dynamic linker names it",
+                path,
+            )
+            return recovered
+        return None
+
     @staticmethod
     def _same_file(wanted: str, cached: str) -> bool:
         """Whether ``cached`` is ``wanted`` allowing for usr-merge and container
@@ -2051,7 +2129,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
         self,
         vmlinux_module_name: str,
         loaders: Dict[str, int],
-        cached_paths: Set[str],
+        cached_paths: Dict[str, int],
     ) -> List[LoaderCheck]:
         """Reads every glibc dynamic linker in the page cache and checks that it
         still carries the ``/etc/ld.so.preload`` string.
@@ -2117,7 +2195,9 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                 return True
         return False
 
-    def _recover_replacement(self, check: LoaderCheck, cached_paths: Set[str]) -> None:
+    def _recover_replacement(
+        self, check: LoaderCheck, cached_paths: Dict[str, int]
+    ) -> None:
         """Fills ``check.reads`` / ``candidates`` for a patched loader."""
         live = check.recovered.data
         directory = check.recovered.path.rsplit("/", 1)[0]
@@ -2372,14 +2452,18 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
         # so name reads are capped just past the longest wanted one: a longer name
         # comes back without a NUL terminator and compares unequal.
         name_read_len = max(len(name) for name in wanted_basenames) + 1
-        wanted_inodes = {
-            entry.recovered.inode_addr: entry.library
-            for entry in entries
-            if entry.recovered is not None
-        }
+        # One inode can be named by several entries (/lib64/x.so in the preload
+        # file and a bare x.so in LD_PRELOAD, say), so every name is kept and a
+        # mapping process is credited to all of them.
+        wanted_inodes: Dict[int, Tuple[str, ...]] = {}
+        for entry in entries:
+            if entry.recovered is not None:
+                names = wanted_inodes.get(entry.recovered.inode_addr, ())
+                if entry.library not in names:
+                    wanted_inodes[entry.recovered.inode_addr] = names + (entry.library,)
         by_library: Dict[str, Set[int]] = {name: set() for name in wanted_names}
         discovered_inodes: Dict[str, int] = {}
-        file_cache: Dict[int, Optional[str]] = {}
+        file_cache: Dict[int, Tuple[str, ...]] = {}
 
         vmlinux = self.context.modules[self.config["kernel"]]
         layer = self.context.layers[vmlinux.layer_name]
@@ -2427,8 +2511,8 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
         except missing_member:
             vm_next_off = None  # maple-tree kernel; the list walk is never taken
 
-        def classify_file(file_addr: int, task) -> Optional[str]:
-            """Which wanted library (if any) this file struct is.
+        def classify_file(file_addr: int, task) -> Tuple[str, ...]:
+            """Which wanted libraries (if any) this file struct is.
 
             Inode address first -- the library's inode is known from the page cache
             walk, so a hit is an integer comparison. Only a matching dentry
@@ -2442,7 +2526,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                 else:
                     dentry_addr = read_ptr(file_addr + f_path_dentry_off)
                     if not dentry_addr:
-                        return None
+                        return ()
                     inode_addr = read_ptr(dentry_addr + d_inode_off)
                 if inode_addr and inode_addr in wanted_inodes:
                     return wanted_inodes[inode_addr]
@@ -2450,10 +2534,10 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                 if not dentry_addr:
                     dentry_addr = read_ptr(file_addr + f_path_dentry_off)
                     if not dentry_addr:
-                        return None
+                        return ()
                 name_ptr = read_ptr(dentry_addr + d_name_name_off)
                 if not name_ptr:
-                    return None
+                    return ()
                 try:
                     basename = layer.read(name_ptr, name_read_len).split(b"\x00", 1)[0]
                 except exceptions.InvalidAddressException:
@@ -2466,13 +2550,14 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                         .encode("utf-8", "replace")
                     )
                 if basename not in wanted_basenames:
-                    return None
+                    return ()
 
                 filp = vmlinux.object("file", offset=file_addr, absolute=True)
                 path = linux_symbols.LinuxUtilities.path_for_file(
                     self.context, task, filp
                 )
-                for name in wanted_names:
+                hits: List[str] = []
+                for name in sorted(wanted_names):
                     expanded = self._expand_tokens(name)
                     hit = (
                         path == name
@@ -2491,15 +2576,15 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                         # this inode; remember it as the recovery fallback.
                         if inode_addr:
                             discovered_inodes.setdefault(name, inode_addr)
-                        return name
+                        hits.append(name)
                 for name, regex in path_matchers:
-                    if regex.search(path):
+                    if name not in hits and regex.search(path):
                         if inode_addr:
                             discovered_inodes.setdefault(name, inode_addr)
-                        return name
+                        hits.append(name)
+                return tuple(hits)
             except (exceptions.InvalidAddressException, AttributeError, ValueError):
-                return None
-            return None
+                return ()
 
         for task in pslist.PsList.list_tasks(self.context, self.config["kernel"]):
             try:
@@ -2515,12 +2600,11 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             ):
                 if not file_addr:
                     continue
-                if file_addr in file_cache:
-                    library = file_cache[file_addr]
-                else:
-                    library = classify_file(file_addr, task)
-                    file_cache[file_addr] = library
-                if library is not None:
+                libraries = file_cache.get(file_addr)
+                if libraries is None:
+                    libraries = classify_file(file_addr, task)
+                    file_cache[file_addr] = libraries
+                for library in libraries:
                     by_library[library].add(pid)
 
         for entry in entries:
@@ -2682,7 +2766,12 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                     )
             else:
                 hooks = na()
-                if recovered is not None and not recovered.data:
+                if recovered is None:
+                    # Nothing in the page cache (and no mapping process, with
+                    # the correlation on) leads to the file: it was never
+                    # cached, or it is named under a path that does not exist.
+                    notes.append("library not found in the page cache")
+                elif not recovered.data:
                     # The library was located but its content was not recoverable
                     # from the page cache, so its exports cannot be read. Say so
                     # rather than leaving a bare "-".
@@ -2847,6 +2936,12 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                 yield description, modified, check.recovered.modification_time
             if check.recovered.change_time:
                 yield description, changed, check.recovered.change_time
+        for artifact in self._linker_artifacts:
+            description = f"dynamic linker copy {artifact.path}"[:400]
+            if artifact.modification_time:
+                yield description, modified, artifact.modification_time
+            if artifact.change_time:
+                yield description, changed, artifact.change_time
 
     def run(self):
         return renderers.TreeGrid(

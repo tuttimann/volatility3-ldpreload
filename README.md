@@ -38,7 +38,9 @@ library and the loader as the kernel holds them, which no userland hook can touc
     instead, recovered exactly by diffing against a leftover copy of the original or by
     elimination from the loader's own strings, verified against the page cache;
   - reports **leftover loader copies** (`ld-*.so.tmp`, `.bak`, ...) that an in-place
-    patch leaves behind.
+    patch leaves behind;
+  - analyses the file a patched loader names **whatever it is called and wherever it
+    is**, including names the content scan would not inspect on its own.
 - **Detects `LD_PRELOAD` / `LD_AUDIT` in process environments.** The same
   interposition works per process without touching any file: export the variable once
   and every process started from that shell inherits it. Each task's exec-time
@@ -52,14 +54,15 @@ library and the loader as the kernel holds them, which no userland hook can touc
   `libdlwrapper.so`) in a system library directory are still reported, marked as
   assumed safe; `--filter-safe-env` hides them.
 - **Feeds `timeliner`** with the modification and change times of preload files,
-  libraries and patched loaders, and **extracts** all of them with `--dump`.
+  libraries, patched loaders and leftover loader copies, and **extracts** all of them
+  with `--dump`.
 - **Runs on kernels the framework alone cannot read**: kABI-padded RHEL/CentOS 7 and 8
   kernels, whose symbol tables hide the radix-tree node height or `struct page`
   fields, are handled by a self-validating compatibility reader.
 
 ## Requirements
 
-- Volatility 3 ≥ 2.0 (developed and tested with 2.28) and a symbol table (ISF) for the
+- Volatility 3 ≥ 2.26 (developed and tested with 2.28) and a symbol table (ISF) for the
   image's kernel, as for any Linux plugin.
 - No third-party Python packages.
 
@@ -267,12 +270,29 @@ forwarder, which sets `LD_PRELOAD` for its own processes, produce no false posit
   file and the process correlation are unaffected.
 - A preload library whose pages were never cached and that no process maps can be named
   but not analysed; the `Notes` column says so.
+- Volatility 2.28's `timeliner.Timeliner` has a bug of its own: every row of its table
+  shows the timestamps of the plugin's *last* timeline item. The plugin's own `File
+  Modification Time` / `Library Modification Time` columns and `Notes` are unaffected.
+
+## Tests
+
+The image-independent code (ELF reader, preload-file parsing and content test, path
+resolution, environment assessment, patched-loader string recovery, name patterns,
+rendering helpers) has a unit-test suite that needs no memory image, only an
+importable `volatility3`:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The same suite runs in GitHub Actions on every push.
 
 ## Repository layout
 
 ```
-linux/ldpreload.py   the plugin (single file)
-CHANGELOG.md         version history
+linux/ldpreload.py        the plugin (single file)
+tests/test_ldpreload.py   unit tests (no memory image needed)
+CHANGELOG.md              version history
 ```
 
 ## License
