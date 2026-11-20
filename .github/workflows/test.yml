@@ -6,7 +6,9 @@ on:
 
 jobs:
   unit:
-    runs-on: ubuntu-latest
+    # actions/setup-python ships no Python 3.9 build for the current ubuntu-latest
+    # image; that job stays on the last image that has one.
+    runs-on: ${{ matrix.python-version == '3.9' && 'ubuntu-24.04' || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
