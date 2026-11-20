@@ -3,6 +3,79 @@
 All notable changes to `linux.ldpreload` are documented here. Versions follow the
 plugin's `_version` tuple.
 
+## 1.7.0 (2026-11-20)
+
+- Fixed (review): the pattern deciding whether a token names a shared object
+  backtracked exponentially on a token such as `/x.so.a.a.a[...]/z`. The content scan
+  applies it to every small file in the page cache, so one 100-byte file written by
+  any user of the imaged system hung the plugin. The pattern is now unambiguous and
+  matches the same names.
+- Fixed (review): a name with several `$LIB`/`$PLATFORM`/`$ORIGIN` tokens (from a
+  preload file or an `LD_PRELOAD` value) was matched against every cached library
+  with a regex that backtracks polynomially, the token count being the degree; ten
+  adjacent tokens took seconds per library, fourteen never returned. The regex is
+  replaced by a matcher that is linear in the path per token and gives the same
+  results; a name with more than eight tokens is not matched at all.
+- Fixed (review): an inode time the framework cannot convert (the epoch itself, as
+  `touch -d @0` sets it, a negative or an out-of-range value) comes back as an
+  absent-value object rather than a `datetime`. It reached the `mtime`/`ctime`
+  comparison and raised `TypeError` in the middle of the output, and was handed to
+  `timeliner` as a timestamp. Such a time is now shown as not available; an inode
+  layout the framework does not know is handled the same way instead of raising.
+- Fixed (review): preload files were not split the way the loader splits them. glibc
+  separates entries at colons, spaces, tabs and newlines only and treats a `#`
+  anywhere as the start of a comment. The plugin did not split at colons
+  (`/lib/a.so:/lib/b.so` was one unresolvable name, and a disguised preload file
+  written that way failed the confirmation gate), took a comment only at the start
+  of a line (`/lib/a.so#x` was neither resolved nor recognised as preload content,
+  `/lib/a.so # note` listed `#` and `note` as libraries), and split at every Unicode
+  whitespace character, cutting a path the loader reads whole.
+- Fixed (review): `LD_PRELOAD` is split at colons and spaces and `LD_AUDIT` at
+  colons only, as the loader does; before, any whitespace split both.
+- Fixed (review): only the file a patched loader names had a read budget. Preload
+  files found by name, libraries, dynamic linkers and leftover loader copies were
+  read up to whatever `i_size` declared, so a sparse file with one cached page at
+  its end (`ld-2.17.so.tmp` in `/tmp` is enough) made the reader zero-fill
+  everything before it, and the resulting `MemoryError` was not caught. Each now has
+  a budget (`PRELOAD_FILE_MAX_SIZE` 1 MiB, `LOADER_MAX_SIZE` 32 MiB,
+  `FILE_READ_MAX_SIZE` 256 MiB for a library; constants, not options). A larger file
+  is read up to its budget and `Notes` say so; running out of memory skips the
+  file's content with a note instead of ending the run. An unreadable `i_size` no
+  longer unbounds the read. A loader cut at the budget is reported as inconclusive,
+  never as patched.
+- Fixed (review): the check for an uncached `.rodata` page of a loader counted its
+  4 KiB chunks from the start of the section, which is rarely page aligned (it is
+  not in `ld-2.17.so`). Each chunk then straddled the missing page, none was all
+  zero, and a loader that merely was not fully cached was reported as patched. The
+  check now looks at the file's pages.
+- Fixed (review): a library whose symbol table could not be read was reported as
+  overriding nothing: no section headers (stripped with `sstrip`, which the loader
+  does not mind, or their page at the end of the file not cached), an uncached page
+  of `.dynsym`/`.dynstr`, or more than the 65536 symbols that are parsed. `Overridden
+  Functions` now shows not available (`-`) instead of `N/A` and `Notes` say that the
+  symbol table was not fully readable.
+- Changed: an `LD_PRELOAD` / `LD_AUDIT` library is assumed safe only if its symbol
+  table was read in full. A library in a system directory that is not in the page
+  cache, not recoverable or has no readable symbol table was marked as assumed safe
+  (and hidden by `--filter-safe-env`) although nothing of it had been seen; it is now
+  reported without that mark.
+- Fixed (review): a symbol name was searched for its terminator through the whole
+  string table, once per symbol; a crafted table without terminators made that
+  65536 full scans. The search stops after 4096 bytes.
+- Fixed (review): the dentry-name read of the process correlation was sized by the
+  longest wanted basename, which an environment value can make as long as it likes;
+  it is capped at a file name's maximum length.
+- Fixed (review): the task list is walked defensively in the superblock enumeration
+  and the process correlation too, as it already was in the environment check; a
+  read error in the middle of the list ended the run.
+- The plugin now declares its dependency on `LinuxUtilities` (2.x), whose
+  `get_path_mnt()` and `path_for_file()` it calls.
+- Tests: 28 new tests cover the above (27 of them fail against 1.6.0; the last
+  checks the declared requirements against the installed framework). The two
+  backtracking cases run under a deadline so that a regression fails instead of
+  hanging the suite. CI also runs the plugin's load check (`vol -p . ... --help`)
+  and adds Python 3.14.
+
 ## 1.6.0 (2026-10-07)
 
 - Fixed: the string scan of a patched loader skipped every second absolute path in

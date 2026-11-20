@@ -57,7 +57,8 @@ library and the loader as the kernel holds them, which no userland hook can touc
   like a shared object, overrides libc functions). Legitimate preloads (sanitisers,
   allocators, `fakeroot`, a vendor wrapper such as the Splunk forwarder's
   `libdlwrapper.so`) in a system library directory are still reported, marked as
-  assumed safe; `--filter-safe-env` hides them.
+  assumed safe; `--filter-safe-env` hides them. A library whose symbol table could
+  not be read is never assumed safe.
 - **Feeds `timeliner`** with the modification and change times of preload files,
   libraries, patched loaders and leftover loader copies, and **extracts** all of them
   with `--dump`.
@@ -114,7 +115,7 @@ with running processes.
 | `--scan-dir DIR [DIR ...]` | Restrict the disguised-preload content scan to these directories. Default: the whole page cache. The file a patched dynamic linker names is still analysed outside them (up to the 1 MiB loader-target budget). |
 | `--no-scan` | Disable the content scan, the dynamic-linker integrity check and the tamper-artifact check; only `/etc/ld.so.preload` is used. |
 | `--no-env` | Do not read process environments for `LD_PRELOAD` / `LD_AUDIT`. |
-| `--filter-safe-env` | Hide `LD_PRELOAD` / `LD_AUDIT` libraries that are assumed safe: in a system library directory with no suspicious trait, or a well-known preload (sanitisers, allocators, fakeroot, a vendor wrapper such as the Splunk forwarder's `libdlwrapper.so`). By default every process carrying the variable is reported. |
+| `--filter-safe-env` | Hide `LD_PRELOAD` / `LD_AUDIT` libraries that are assumed safe: in a system library directory with no suspicious trait, or a well-known preload (sanitisers, allocators, fakeroot, a vendor wrapper such as the Splunk forwarder's `libdlwrapper.so`). Only a library whose symbol table was read in full qualifies. By default every process carrying the variable is reported. |
 | `--all-symbols` | List every exported function of each library, not only those that shadow a known libc/PAM/pcap function. |
 | `--skip-maps` | Do not walk process mappings (faster; `Mapped PIDs` stays empty). |
 | `--wrap N` | Fold the long cells (function lists, PID lists, notes) into lines of at most `N` characters. By default this happens only with `-r pretty`, which prints the folded cells as narrow blocks; every other renderer gets single-line cells. A value forces folding for any renderer, `0` disables it. |
@@ -153,7 +154,7 @@ row per patched dynamic linker and per leftover loader copy. Seven columns:
 | File Modification Time | That file's `mtime`: when the preload file was written, or when the loader was patched. `N/A` for an environment row. |
 | Library | The shared object the line or variable names, exactly as written (tokens such as `$PLATFORM` are kept; a bare or relative value is resolved by basename and the note says to which file). `(dynamic linker)` / `(dynamic linker copy)` for linker rows. |
 | Library Modification Time | The recovered library's `mtime`. |
-| Overridden Functions | Global `FUNC` symbols in the library's `.dynsym` that shadow a libc/PAM/pcap function of interest (or everything, with `--all-symbols`). |
+| Overridden Functions | Global `FUNC` symbols in the library's `.dynsym` that shadow a libc/PAM/pcap function of interest (or everything, with `--all-symbols`). `N/A` means the symbol table was read and holds none; `-` means it could not be read (the note says why), so the list is unknown. |
 | Mapped PIDs | Processes that currently map the library; consecutive PIDs collapsed into `first-last` ranges. |
 | Notes | How the file was found, which processes carry an `LD_PRELOAD` variable and why the library is suspicious, what a patched loader reads, anything that limits the analysis, and a warning when a file's change time is well after its modification time (the `mtime` was preserved from an original or set deliberately; the change time is when the file really got its content). |
 
@@ -229,16 +230,19 @@ preload file is present.
    same-directory leftover copy by byte diff, or from the loader's `/`-strings minus
    the stock ones, cross-checked against the page cache.
 4. **ELF parsing.** A small defensive reader parses `.dynsym` from the recovered image
-   (holes allowed) and keeps global `FUNC` definitions.
+   (holes allowed) and keeps global `FUNC` definitions. It records whether the table
+   was read in full; a missing section header table or an uncached page of the
+   symbols makes the result "unknown", not "none".
 5. **Process correlation.** Each task's VMAs are followed with raw reads
    (`vma → vm_file → dentry`); a wanted library is recognised by inode address, and only
    a matching basename pays for full path reconstruction. A library no cached dentry
    leads to anymore is recovered from the mapping process's `vm_file` inode.
 6. **Environment check.** Each task's `mm->env_start .. env_end` block is read
    (padded, so a swapped page costs only that page) and split into `KEY=VALUE` strings;
-   `LD_PRELOAD` and `LD_AUDIT` values are split on `:` / whitespace and each object goes
-   through steps 4 and 5. A library in a system library directory with no suspicious
-   trait is marked as assumed safe; `--filter-safe-env` hides such rows.
+   `LD_PRELOAD` values are split at colons and spaces and `LD_AUDIT` values at colons,
+   as the loader splits them, and each object goes through steps 4 and 5. A library
+   in a system library directory with no suspicious trait, whose symbol table was
+   read in full, is marked as assumed safe; `--filter-safe-env` hides such rows.
 7. **Compatibility readers.** Where the framework's page-cache reader fails (the
    radix-tree node height on kABI-padded 3.10 kernels, `struct page` without
    `mapping`/`index` on 4.18), the plugin decodes the structures raw and validates the
@@ -264,6 +268,15 @@ forwarder, which sets `LD_PRELOAD` for its own processes, produce no false posit
 - Overridden functions come from `.dynsym`; a library that hooks purely by patching its
   own imports at runtime is still reported (with PIDs and timestamps) but with an empty
   function list.
+- `.dynsym` is located through the section header table at the end of the file. A
+  library without one (stripped), or whose last pages are not cached, is reported
+  with an unknown function list (`-`, and a note); the dynamic segment is not parsed
+  as a fallback.
+- Every file read has a size budget, so that a sparse or smeared inode cannot make
+  the plugin allocate its declared size: 1 MiB for a preload file, 32 MiB for a
+  dynamic linker or a leftover copy, 256 MiB for a library. A larger file is read up
+  to its budget and the note says so. That partial read uses the compatibility
+  reader, which covers the Intel `vmemmap` layout only.
 - The loader check covers glibc; musl has no preload file. A loader whose `.rodata`
   pages are not all cached is reported as inconclusive, never guessed at.
 - Physical-address translation of `struct page` in the fast paths uses the Intel
@@ -283,7 +296,7 @@ forwarder, which sets `LD_PRELOAD` for its own processes, produce no false posit
 
 The image-independent code (ELF reader, preload-file parsing and content test, path
 resolution, environment assessment, patched-loader string recovery, name patterns,
-rendering helpers) has a unit-test suite that needs no memory image, only an
+read budgets, hostile-input cases, rendering helpers) has a unit-test suite that needs no memory image, only an
 importable `volatility3`:
 
 ```bash

@@ -164,6 +164,18 @@ PRELOAD_SCAN_MAX_SIZE = 4096  # a preload list is a few short paths; never a pag
 # otherwise make the reader allocate up to its declared size. A target above it is
 # reported as not analysed instead.
 LOADER_TARGET_MAX_SIZE = 1 << 20
+# Every other file read has a budget too, since i_size is whatever the imaged
+# system says: any local user can leave a sparse file of any size under a name
+# this plugin reads (ld-2.17.so.tmp, a lib*.so named by LD_PRELOAD, ...), and one
+# cached page at its end would make the reader zero-fill everything before it.
+# A file above its budget is read up to the budget and marked as truncated.
+PRELOAD_FILE_MAX_SIZE = LOADER_TARGET_MAX_SIZE  # a preload list, found by name
+LOADER_MAX_SIZE = 32 << 20  # a dynamic linker or a leftover copy of one
+FILE_READ_MAX_SIZE = 256 << 20  # a library
+# A dentry name is at most NAME_MAX bytes, so no name read needs to be longer.
+DENTRY_NAME_MAX = 255
+# An ELF symbol name is not searched for its terminator beyond this.
+ELF_NAME_MAX = 4096
 
 # Returned by the scan's raw first-page reader for a file it cannot decide on
 # (its page-tree head is not a direct page pointer); the caller then reads the
@@ -185,8 +197,17 @@ LOADER_CONFIG_NAMES = frozenset(
 
 # A token naming a shared object, allowing the ld.so dynamic-string tokens
 # ($PLATFORM/$LIB/$ORIGIN) that the loader expands at runtime.
-SO_TOKEN_RE = re.compile(r"\.so(?:\.[^/\s]+)*$")
+# The suffix is one optional group, not a repeated one: "[^/\s]+" already spans
+# further dots, and repeating it made the match ambiguous -- exponential
+# backtracking on a token such as "/x.so.a.a.a.a[...]/z" from any scanned file.
+SO_TOKEN_RE = re.compile(r"\.so(?:\.[^/\s]+)?$")
 DYNAMIC_TOKEN_RE = re.compile(r"\$\{?(?:PLATFORM|LIB|ORIGIN)\}?")
+
+# How glibc (elf/rtld.c) reads the preload file: a "#" starts a comment that runs
+# to the end of the line, wherever it stands, and the entries are separated by
+# colon, space, tab or newline -- nothing else. NUL is added for page-cache holes.
+PRELOAD_COMMENT_RE = re.compile(rb"#[^\n]*")
+PRELOAD_SEPARATOR_RE = re.compile(rb"[: \t\n\x00]+")
 
 # Dynamic linker file names with trailing junk that betrays an in-place patch left
 # on disk: an in-place patch of ld.so typically writes the patched loader to a temp
@@ -474,6 +495,25 @@ STB_LOCAL = 0
 SHN_UNDEF = 0
 
 
+def _has_zero_page(
+    data: bytes, start: int = 0, end: Optional[int] = None, page_size: int = 4096
+) -> bool:
+    """Whether a file page of ``data`` overlapping ``[start, end)`` is all zeros
+    -- the signature of a page that was not in the cache and was zero filled on
+    recovery.
+
+    The pages are the file's, aligned to the start of ``data``: a section rarely
+    begins on a page boundary, and chunks counted from the section's own start
+    would each straddle a missing page and never be all zero."""
+    end = len(data) if end is None else min(end, len(data))
+    start = max(start, 0)
+    for offset in range(start - start % page_size, end, page_size):
+        chunk = data[offset : offset + page_size]
+        if len(chunk) == page_size and not chunk.strip(b"\x00"):
+            return True
+    return False
+
+
 @dataclass
 class ElfInfo:
     """What could be decoded from a recovered ELF image."""
@@ -482,6 +522,10 @@ class ElfInfo:
     bits: int = 0
     #: Global FUNC symbols the object *defines*: these override libc at load time.
     exported: List[str] = field(default_factory=list)
+    #: The symbol table could not be read to its end (no section headers --
+    #: stripped, or their page not cached -- or more symbols than are parsed),
+    #: so ``exported`` is not the whole truth and an empty list proves nothing.
+    incomplete: bool = False
 
     def interposed(self) -> List[str]:
         """Exported functions that shadow a libc function of interest."""
@@ -504,6 +548,8 @@ class ElfReader:
 
         info.bits = 32 if elf_class == 1 else 64
         info.valid = True
+        # Until a symbol table has been walked to its end.
+        info.incomplete = True
 
         try:
             if info.bits == 64:
@@ -622,7 +668,11 @@ class ElfReader:
         start = table_offset + index
         if index >= table_size or start >= len(data):
             return ""
-        end = data.find(b"\x00", start, min(len(data), table_offset + table_size))
+        end = data.find(
+            b"\x00",
+            start,
+            min(len(data), table_offset + table_size, start + ELF_NAME_MAX),
+        )
         if end < 0:
             end = min(len(data), start + 256)
         return data[start:end].decode("utf-8", "replace")
@@ -652,10 +702,18 @@ class ElfReader:
 
         exported: List[str] = []
 
-        count = min(sh_size // entry_size, 65536)
+        total = sh_size // entry_size
+        count = min(total, 65536)
+        # A page of either table that was not cached reads as zeros: null
+        # symbols and empty names, which would pass for "defines nothing".
+        complete = count == total and not (
+            _has_zero_page(data, sh_offset, sh_offset + sh_size)
+            or _has_zero_page(data, str_offset, str_offset + str_size)
+        )
         for index in range(count):
             base = sh_offset + index * entry_size
             if base + entry_size > len(data):
+                complete = False
                 break
             try:
                 st_name = struct.unpack_from(endian + "I", data, base)[0]
@@ -666,6 +724,7 @@ class ElfReader:
                     st_info = data[base + 12]
                     st_shndx = struct.unpack_from(endian + "H", data, base + 14)[0]
             except (struct.error, IndexError):
+                complete = False
                 break
 
             name = cls._string_at(data, str_offset, str_size, st_name)
@@ -683,6 +742,7 @@ class ElfReader:
                 exported.append(name)
 
         info.exported = sorted(set(exported))
+        info.incomplete = not complete
 
 
 # -- page cache access -----------------------------------------------------------
@@ -701,6 +761,10 @@ class RecoveredFile:
     #: ld.so.preload.bak, "disguised" for a preload file found by content, and
     #: "linker-artifact" for a leftover patched-loader copy.
     kind: str = "standard"
+    #: Whether ``data`` is only the part of the file within the read budget.
+    truncated: bool = False
+    #: What limited the read (budget, out of memory), for the Notes.
+    note: str = ""
 
 
 def _nested_member_offset(
@@ -1047,6 +1111,7 @@ def read_inode(
     inode: interfaces.objects.ObjectInterface,
     path: str,
     max_size: Optional[int] = None,
+    limit: int = FILE_READ_MAX_SIZE,
 ) -> RecoveredFile:
     """Reads an inode's cached content, zero filling any pages that are missing.
 
@@ -1054,55 +1119,90 @@ def read_inode(
     outgrows the size a caller has checked. A caller with a byte budget passes
     the size it checked as ``max_size``: both readers are then held to it
     whatever ``i_size`` reads later, and a page outside it raises
-    ``ReadBudgetExceeded`` instead of being dropped or retried."""
+    ``ReadBudgetExceeded`` instead of being dropped or retried.
+
+    Without ``max_size`` the read is held to ``limit`` instead, leniently: a
+    file declaring more (or an unreadable size) is read up to ``limit`` and the
+    result marked ``truncated``; running out of memory yields no content.
+    Either is stated in the result's ``note`` rather than raised."""
     layer_name = context.modules[vmlinux_module_name].layer_name
     bounded = max_size is not None
-    buffer = _read_buffer(max_size if bounded else _declared_size(inode))
-    try:
-        pagecache.InodePages.write_inode_content_to_stream(
-            context, layer_name, inode, buffer
-        )
-    except (
-        exceptions.VolatilityException,
-        AttributeError,
-        ReadBudgetExceeded,
-    ) as excp:
-        if bounded and isinstance(excp, ReadBudgetExceeded):
-            raise
-        vollog.debug("Unable to read pages of %s: %s", path, excp)
-        # On kABI-padded kernels (RHEL/CentOS) the framework cannot resolve the
-        # radix-tree node height (3.10) or ``page.mapping`` (4.18); retry with
-        # the compatibility reader, which resolves both raw. Only a better
-        # result replaces what was read so far.
-        try:
-            data = _read_pages_compat(
-                context,
-                vmlinux_module_name,
-                inode,
-                max_size if bounded else int(inode.i_size),
-                strict=bounded,
+    truncated, note = False, ""
+    if bounded:
+        size = max_size
+    else:
+        declared = _declared_size(inode)
+        size = limit if declared is None else min(declared, limit)
+        if declared is not None and declared > limit:
+            truncated = True
+            note = (
+                f"only the first {limit} of {declared} bytes of {path} were read "
+                "(read budget)"
             )
-        except (exceptions.VolatilityException, AttributeError) as excp:
-            vollog.debug("Compatibility page read of %s failed: %s", path, excp)
-            data = b""
-        if len(data) > len(buffer.getvalue()):
-            vollog.debug(
-                "Recovered %s (%d bytes) with the compatibility page-cache reader",
+            vollog.warning(
+                "%s declares %d bytes, above the %d-byte read budget; only that "
+                "part is read",
                 path,
-                len(data),
+                declared,
+                limit,
             )
-            buffer = BytesIO(data)
+    buffer = _read_buffer(size)
+    try:
+        try:
+            pagecache.InodePages.write_inode_content_to_stream(
+                context, layer_name, inode, buffer
+            )
+        except (
+            exceptions.VolatilityException,
+            AttributeError,
+            ReadBudgetExceeded,
+        ) as excp:
+            if bounded and isinstance(excp, ReadBudgetExceeded):
+                raise
+            vollog.debug("Unable to read pages of %s: %s", path, excp)
+            # On kABI-padded kernels (RHEL/CentOS) the framework cannot resolve
+            # the radix-tree node height (3.10) or ``page.mapping`` (4.18);
+            # retry with the compatibility reader, which resolves both raw. It
+            # also reads the part within the budget of a file larger than it,
+            # which the framework's writer refuses whole. Only a better result
+            # replaces what was read so far.
+            try:
+                data = _read_pages_compat(
+                    context, vmlinux_module_name, inode, size, strict=bounded
+                )
+            except (exceptions.VolatilityException, AttributeError) as excp:
+                vollog.debug("Compatibility page read of %s failed: %s", path, excp)
+                data = b""
+            if len(data) > len(buffer.getvalue()):
+                vollog.debug(
+                    "Recovered %s (%d bytes) with the compatibility page-cache "
+                    "reader",
+                    path,
+                    len(data),
+                )
+                buffer = BytesIO(data)
+    except MemoryError:
+        if bounded:
+            raise
+        vollog.warning("Out of memory while reading %s; its content is skipped", path)
+        buffer = BytesIO()
+        note = f"{path} not read: out of memory"
 
     def safe(fn):
+        # The framework returns an absent-value object, not a datetime, for a
+        # time it cannot convert (the epoch itself, as set by ``touch -d @0``,
+        # included), and raises on an inode layout it does not know.
         try:
-            return fn()
+            value = fn()
         except (
             AttributeError,
-            exceptions.InvalidAddressException,
+            exceptions.VolatilityException,
             ValueError,
             TypeError,
+            OverflowError,
         ):
             return None
+        return value if isinstance(value, datetime.datetime) else None
 
     return RecoveredFile(
         path=path,
@@ -1110,6 +1210,8 @@ def read_inode(
         data=buffer.getvalue(),
         modification_time=safe(inode.get_modification_time),
         change_time=safe(inode.get_change_time),
+        truncated=truncated,
+        note=note,
     )
 
 
@@ -1135,6 +1237,56 @@ class LoaderCheck:
     targets: List[str] = field(default_factory=list)
     #: Whether ``targets`` are several distinct files, none attributable to it.
     ambiguous: bool = False
+
+
+class _TokenSuffixMatcher:
+    """Matches a path against a name carrying ld.so dynamic-string tokens.
+
+    Equivalent to searching with the regex ``literal [^/]+ literal ... literal$``
+    (one ``[^/]+`` per token), but in time linear in the path per token. The
+    name comes from a preload file or a process environment and the paths from
+    the page cache, both of which the imaged system's users control, and the
+    regex backtracks polynomially in the path with the token count as the
+    degree: ``$LIB`` twenty times over never returned.
+    """
+
+    #: A real path carries one or two tokens; a name with more than this many
+    #: is not matched at all, which bounds the work per path.
+    MAX_TOKENS = 8
+
+    def __init__(self, name: str) -> None:
+        self._literals = DYNAMIC_TOKEN_RE.split(name)
+        # Every token stands for at least one character.
+        self._min_length = sum(map(len, self._literals)) + len(self._literals) - 1
+
+    def search(self, path: str) -> bool:
+        literals = self._literals
+        if (
+            len(literals) - 1 > self.MAX_TOKENS
+            or len(path) < self._min_length
+            or not path.endswith(literals[-1])
+        ):
+            return False
+        # Offsets at which the part of the pattern matched so far can begin;
+        # the pattern is anchored at the end of the path and worked backwards.
+        starts = {len(path) - len(literals[-1])}
+        for literal in reversed(literals[:-1]):
+            # The token: one or more non-"/" characters ending right at a start.
+            token_starts = []
+            open_run = False
+            for offset in range(max(starts) - 1, -1, -1):
+                open_run = path[offset] != "/" and (open_run or offset + 1 in starts)
+                if open_run:
+                    token_starts.append(offset)
+            size = len(literal)
+            starts = {
+                offset - size
+                for offset in token_starts
+                if offset >= size and path.startswith(literal, offset - size)
+            }
+            if not starts:
+                return False
+        return True
 
 
 # -- the plugin ------------------------------------------------------------------
@@ -1167,7 +1319,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
     """Recovers ld.so.preload from the page cache and reports the libc functions its libraries override."""
 
     _required_framework_version = (2, 26, 0)
-    _version = (1, 6, 0)
+    _version = (1, 7, 0)
 
     @classmethod
     def get_requirements(cls) -> List[interfaces.configuration.RequirementInterface]:
@@ -1182,6 +1334,11 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             ),
             requirements.VersionRequirement(
                 name="pslist", component=pslist.PsList, version=(4, 0, 0)
+            ),
+            requirements.VersionRequirement(
+                name="linuxutils",
+                component=linux_symbols.LinuxUtilities,
+                version=(2, 0, 0),
             ),
             requirements.VersionRequirement(
                 name="timeliner",
@@ -1223,8 +1380,9 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                 description="Hide LD_PRELOAD / LD_AUDIT libraries that are assumed "
                 "safe: located in a system library directory and showing no "
                 "suspicious trait, or a well-known preload (sanitisers, allocators, "
-                "fakeroot, a vendor wrapper such as the Splunk forwarder's); by "
-                "default every process carrying the variable is reported",
+                "fakeroot, a vendor wrapper such as the Splunk forwarder's). A "
+                "library whose symbols could not be read is never assumed safe; "
+                "by default every process carrying the variable is reported",
                 default=False,
                 optional=True,
             ),
@@ -1302,7 +1460,9 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
         """
         seen_namespaces: Set[int] = set()
         seen_superblocks: Set[int] = set()
-        for task in pslist.PsList.list_tasks(context, vmlinux_module_name):
+        for task in cls._safe_iter(
+            iter(pslist.PsList.list_tasks(context, vmlinux_module_name))
+        ):
             try:
                 nsproxy = task.nsproxy
                 if not (nsproxy and nsproxy.is_readable()):
@@ -1626,7 +1786,11 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                 inode = vmlinux.object("inode", offset=inode_addr, absolute=True)
                 if self._inode_usable(inode):
                     recovered = read_inode(
-                        self.context, vmlinux_module_name, inode, path
+                        self.context,
+                        vmlinux_module_name,
+                        inode,
+                        path,
+                        limit=PRELOAD_FILE_MAX_SIZE,
                     )
                     if copy_match(path):
                         recovered.kind = "copy"
@@ -1791,6 +1955,8 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                 )
             else:
                 detection = ""
+            if preload.note:
+                detection = "; ".join(part for part in (detection, preload.note) if part)
             for name in names:
                 entry = PreloadEntry(
                     preload_path=preload.path,
@@ -1918,9 +2084,12 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                 yield key.decode("ascii"), value.decode("utf-8", "replace")
 
     @staticmethod
-    def _split_preload_value(value: str) -> List[str]:
-        """The objects named by an LD_PRELOAD value (colon or space separated)."""
-        return [item for item in re.split(r"[:\s]+", value.strip()) if item]
+    def _split_preload_value(value: str, variable: str = "LD_PRELOAD") -> List[str]:
+        """The objects a value names, split the way the loader splits it:
+        LD_PRELOAD at colons and spaces, LD_AUDIT at colons only. Any other
+        whitespace is part of a name, as it is for the loader."""
+        separators = ":" if variable == "LD_AUDIT" else " :"
+        return [item for item in re.split(f"[{separators}]+", value) if item]
 
     def _collect_env_preloads(self, vmlinux_module_name: str) -> List[PreloadEntry]:
         """One entry per (variable, library) found in any task's environment."""
@@ -1940,7 +2109,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             except (exceptions.InvalidAddressException, AttributeError, ValueError):
                 continue
             for variable, value in hits:
-                for name in self._split_preload_value(value):
+                for name in self._split_preload_value(value, variable):
                     entry = found.get((variable, name))
                     if entry is None:
                         entry = found[(variable, name)] = PreloadEntry(
@@ -1992,12 +2161,22 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             # A well-known preload library in a system directory is expected use;
             # so is a vendor library in a system directory that shows none of
             # the traits above (e.g. the Splunk forwarder's own dlopen wrapper).
-            # Either is marked as assumed safe and hidden by --filter-safe-env.
-            entry.benign = in_system_dir and (
-                not reasons
-                or (
-                    reasons == ["overrides libc functions"]
-                    and bool(BENIGN_PRELOAD_RE.match(basename))
+            # Either is marked as assumed safe and hidden by --filter-safe-env --
+            # but only if its exports were actually read. A library that is not
+            # cached, not recoverable, or has no readable symbol table shows no
+            # trait because nothing of it was seen, which is not the same thing.
+            analysed = bool(
+                entry.elf and entry.elf.valid and not entry.elf.incomplete
+            )
+            entry.benign = (
+                analysed
+                and in_system_dir
+                and (
+                    not reasons
+                    or (
+                        reasons == ["overrides libc functions"]
+                        and bool(BENIGN_PRELOAD_RE.match(basename))
+                    )
                 )
             )
             entry.reasons = reasons
@@ -2017,21 +2196,20 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
     def _parse_preload(data: bytes) -> List[str]:
         """Splits an ld.so.preload file into library paths.
 
-        The loader treats the file as a whitespace separated list, so newlines and
-        spaces are equivalent. Comments are not part of the format, but a '#' line is
-        skipped anyway because administrators write them and the loader would only
-        fail to find the resulting path. NUL bytes are treated as separators too: a
-        page cache hole is recovered as zeros, and gluing the text on either side of
-        it into one token would lose both paths.
+        Split exactly as the loader splits it, on the bytes: a '#' starts a
+        comment that runs to the end of its line, and entries are separated by
+        colons, spaces, tabs and newlines only -- a carriage return, a no-break
+        space or any other "whitespace" is part of a name, so a path the loader
+        reads whole is not cut in two here. NUL bytes are treated as separators
+        too: a page cache hole is recovered as zeros, and gluing the text on
+        either side of it into one token would lose both paths.
         """
-        names: List[str] = []
-        text = data.decode("utf-8", "replace").replace("\x00", " ")
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            names.extend(token for token in line.split() if token)
-        return names
+        data = PRELOAD_COMMENT_RE.sub(b" ", data)
+        return [
+            token.decode("utf-8", "replace")
+            for token in PRELOAD_SEPARATOR_RE.split(data)
+            if token
+        ]
 
     @staticmethod
     def _inode_usable(inode: interfaces.objects.ObjectInterface) -> bool:
@@ -2045,8 +2223,8 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
     def _looks_like_preload(data: bytes) -> bool:
         """Whether the file content is an ld.so.preload list and nothing else.
 
-        A preload file is exclusively a whitespace/newline separated list of
-        absolute paths to shared objects. Requiring *every* non-comment token to
+        A preload file is exclusively a list of absolute paths to shared
+        objects, separated as ``_parse_preload`` describes. Requiring *every* non-comment token to
         be an absolute ``.so`` path is what separates a disguised preload file
         from ordinary /etc config that merely mentions a library: prelink,
         sestatus, GSS-mech and the like always carry non-path tokens (section
@@ -2114,8 +2292,14 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             inode = vmlinux.object("inode", offset=inode_addr, absolute=True)
             if not self._inode_usable(inode):
                 continue
-            recovered = read_inode(self.context, vmlinux_module_name, inode, path)
-            if not self._looks_like_preload(recovered.data):
+            recovered = read_inode(
+                self.context,
+                vmlinux_module_name,
+                inode,
+                path,
+                limit=PRELOAD_SCAN_MAX_SIZE,
+            )
+            if recovered.truncated or not self._looks_like_preload(recovered.data):
                 continue
             seen_inodes.add(inode_addr)
             recovered.kind = "disguised"
@@ -2349,7 +2533,9 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             inode = vmlinux.object("inode", offset=inode_addr, absolute=True)
             if not self._inode_usable(inode):
                 continue
-            recovered = read_inode(self.context, vmlinux_module_name, inode, path)
+            recovered = read_inode(
+                self.context, vmlinux_module_name, inode, path, limit=LOADER_MAX_SIZE
+            )
             data = recovered.data
             if not data.startswith(ELF_MAGIC):
                 vollog.debug("Dynamic linker %s: content not recoverable", path)
@@ -2359,10 +2545,11 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                 checks.append(LoaderCheck(recovered, "intact"))
                 continue
             # Absent. Decide whether the string's home, .rodata, was actually read
-            # before calling the loader patched; a missing page reads as zeros.
+            # before calling the loader patched; a missing page reads as zeros,
+            # and a file cut at the read budget may hold the string further on.
             rodata = ElfReader.section_range(data, ".rodata")
-            region = data[rodata[0] : rodata[0] + rodata[1]] if rodata else data
-            if self._has_zero_page(region):
+            start, size = rodata if rodata else (0, len(data))
+            if recovered.truncated or self._has_zero_page(data, start, start + size):
                 vollog.warning(
                     "Dynamic linker %s does not contain the /etc/ld.so.preload "
                     "string, but part of its read-only data is not cached; "
@@ -2383,14 +2570,12 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
         return checks
 
     @staticmethod
-    def _has_zero_page(region: bytes, page_size: int = 4096) -> bool:
-        """Whether ``region`` contains a whole page of zeros -- the signature of
-        a page that was not in the cache and was zero filled on recovery."""
-        for offset in range(0, len(region), page_size):
-            chunk = region[offset : offset + page_size]
-            if len(chunk) == page_size and not chunk.strip(b"\x00"):
-                return True
-        return False
+    def _has_zero_page(
+        data: bytes, start: int = 0, end: Optional[int] = None, page_size: int = 4096
+    ) -> bool:
+        """Whether a file page of ``data`` overlapping ``[start, end)`` is all
+        zeros (see the module-level ``_has_zero_page``)."""
+        return _has_zero_page(data, start, end, page_size)
 
     def _recover_replacement(
         self, check: LoaderCheck, cached_paths: Dict[str, int]
@@ -2466,7 +2651,9 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             inode = vmlinux.object("inode", offset=inode_addr, absolute=True)
             if not self._inode_usable(inode):
                 continue
-            recovered = read_inode(self.context, vmlinux_module_name, inode, path)
+            recovered = read_inode(
+                self.context, vmlinux_module_name, inode, path, limit=LOADER_MAX_SIZE
+            )
             # The name says loader copy; the content has to agree when it is
             # available, or a stray text file under such a name would be reported.
             if recovered.data and not recovered.data.startswith(ELF_MAGIC):
@@ -2535,16 +2722,10 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
         return None
 
     @staticmethod
-    def _token_suffix_regex(name: str) -> "re.Pattern":
-        """A suffix regex for a path with dynamic tokens, each token -> one path
-        component fragment ([^/]+)."""
-        parts, last = [], 0
-        for match in DYNAMIC_TOKEN_RE.finditer(name):
-            parts.append(re.escape(name[last : match.start()]))
-            parts.append(r"[^/]+")
-            last = match.end()
-        parts.append(re.escape(name[last:]))
-        return re.compile("".join(parts) + r"$")
+    def _token_suffix_regex(name: str) -> "_TokenSuffixMatcher":
+        """A suffix matcher for a path with dynamic tokens, each token -> one
+        path component fragment (``[^/]+``); used through ``search(path)``."""
+        return _TokenSuffixMatcher(name)
 
     # -- process correlation -----------------------------------------------------
     #
@@ -2623,6 +2804,15 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             yield ptr_at(buf, vm_file_off - span_start)
             addr = ptr_at(buf, vm_next_off - span_start)
 
+    @staticmethod
+    def _name_read_len(wanted_basenames: Set[bytes]) -> int:
+        """How many bytes of a dentry name to read: one past the longest wanted
+        basename, but never more than a name can be long plus its terminator.
+        A value from a process environment can be far longer than any file
+        name, and would otherwise size a read done once per mapped file."""
+        longest = max(len(name) for name in wanted_basenames)
+        return min(longest, DENTRY_NAME_MAX) + 1
+
     def _correlate_processes(self, entries: List[PreloadEntry]) -> Dict[str, int]:
         """Finds which running processes currently map each library.
 
@@ -2636,7 +2826,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
         # expanded basename are accepted at the cheap gate, and a token'd name is
         # matched as a suffix regex when the full path is reconstructed.
         wanted_basenames: Set[bytes] = set()
-        path_matchers: List[Tuple[str, "re.Pattern"]] = []
+        path_matchers: List[Tuple[str, _TokenSuffixMatcher]] = []
         for name in wanted_names:
             expanded = self._expand_tokens(name)
             for variant in {name, expanded}:
@@ -2648,7 +2838,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
         # A dentry name longer than every wanted basename can only be a mismatch,
         # so name reads are capped just past the longest wanted one: a longer name
         # comes back without a NUL terminator and compares unequal.
-        name_read_len = max(len(name) for name in wanted_basenames) + 1
+        name_read_len = self._name_read_len(wanted_basenames)
         # One inode can be named by several entries (/lib64/x.so in the preload
         # file and a bare x.so in LD_PRELOAD, say), so every name is kept and a
         # mapping process is credited to all of them.
@@ -2783,7 +2973,9 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             except (exceptions.InvalidAddressException, AttributeError, ValueError):
                 return ()
 
-        for task in pslist.PsList.list_tasks(self.context, self.config["kernel"]):
+        for task in self._safe_iter(
+            iter(pslist.PsList.list_tasks(self.context, self.config["kernel"]))
+        ):
             try:
                 pid = int(task.pid)
                 mm = task.mm
@@ -2950,7 +3142,19 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                 notes.append(self._env_note(entry))
             if elf is not None and elf.valid:
                 functions = elf.exported if show_all else elf.interposed()
-                hooks = self._wrap(", ".join(functions), 48) if functions else nap()
+                if functions:
+                    hooks = self._wrap(", ".join(functions), 48)
+                else:
+                    # "None" only if the whole symbol table was read; otherwise
+                    # the list is unknown, not empty.
+                    hooks = na() if elf.incomplete else nap()
+                if elf.incomplete:
+                    notes.append(
+                        "symbol table not fully readable (section headers stripped, "
+                        "not cached or beyond the read budget); the overridden "
+                        "functions are "
+                        + ("incomplete" if functions else "unknown")
+                    )
                 if not functions and entry.env_var and elf.exported:
                     # A preload that overrides nothing known is still worth a
                     # look at what it does export.
@@ -2979,6 +3183,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                 )
             )
             if recovered is not None:
+                notes.append(recovered.note)
                 notes.append(
                     self._timestamp_note(
                         "library", recovered.modification_time, recovered.change_time
@@ -3045,6 +3250,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             note = "; ".join(
                 [f"patched dynamic linker: {target} instead of /etc/ld.so.preload"]
                 + check.notes
+                + ([check.recovered.note] if check.recovered.note else [])
             )
             stamp = self._timestamp_note(
                 "loader",
@@ -3071,6 +3277,8 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                 "leftover copy of the dynamic linker, consistent with an in-place "
                 "patch of ld.so"
             )
+            if artifact.note:
+                note = f"{note}; {artifact.note}"
             stamp = self._timestamp_note(
                 "copy", artifact.modification_time, artifact.change_time
             )
