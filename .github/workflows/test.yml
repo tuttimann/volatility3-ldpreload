@@ -26,3 +26,23 @@ jobs:
         run: vol -p . linux.ldpreload.LdPreload --help
       - name: Unit tests
         run: python -m unittest discover -s tests -v
+
+  minimum-framework:
+    # The oldest framework the plugin accepts (_required_framework_version
+    # 2.26.0), so that a call into an API added later fails here. Python 3.12:
+    # a release the framework supported when 2.26.0 came out, with a
+    # setup-python build on ubuntu-latest (the 3.12 job above runs there).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Volatility 3 2.26.0
+        run: python -m pip install "volatility3==2.26.0"
+      - name: Byte-compile the plugin
+        run: python -m py_compile linux/ldpreload.py
+      - name: Load the plugin through the framework
+        run: vol -p . linux.ldpreload.LdPreload --help
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v

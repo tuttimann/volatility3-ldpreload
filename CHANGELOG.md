@@ -3,6 +3,54 @@
 All notable changes to `linux.ldpreload` are documented here. Versions follow the
 plugin's `_version` tuple.
 
+## 1.8.0 (2026-11-20)
+
+- Changed: the dynamic symbol table is now located the way the loader locates it,
+  through the program headers: `PT_DYNAMIC` gives `DT_SYMTAB`, `DT_STRTAB`,
+  `DT_STRSZ` and `DT_SYMENT`, its addresses are mapped to file offsets through the
+  `PT_LOAD` segments' file parts, and the symbol count comes from `DT_GNU_HASH`
+  (one past the end of the chain the highest bucket starts) or `DT_HASH`
+  (`nchain`). Closes the item left open in 1.7.0: section headers, which the loader
+  never reads and anyone can rewrite, no longer decide what a library exports. A
+  library stripped of its section headers (`sstrip`) is now read in full.
+- Changed: the section headers' `.dynsym` is a cross-check. A different offset,
+  symbol count or set of exported functions, or no `.dynsym` at all, is reported in
+  `Notes` ("section headers disagree with the dynamic segment (...)", naming the
+  functions only one of them lists) and makes the read incomplete, so the library is
+  not assumed safe. Section headers that were not recovered (cut off, or on an
+  uncached page) are not a disagreement. Without a readable dynamic segment the
+  section headers are a fallback, as before, and never a complete read.
+- Changed: a library is assumed safe (and hidden by `--filter-safe-env`) only if its
+  table was read in full through the dynamic segment: hash table, symbol table and
+  string table without an uncached page, at least one symbol, no contradiction
+  between `DT_HASH` and `DT_GNU_HASH`, and a consistent cross-check.
+- The reader stays defensive and never raises. Forged values are bounded: at most
+  512 program headers (more marks the header table implausible), 4096 dynamic
+  entries (no `DT_NULL` within them, or within the segment, is noted), 2^20 hash
+  buckets and bloom words, and the GNU chain walk and the symbol read stop at 65536
+  symbols. Segments whose file part wraps the address or offset range map nothing;
+  an address that two `PT_LOAD` segments map to different file offsets, several
+  `PT_DYNAMIC` segments or a `DT_SYMENT` other than the ELF class's are noted and
+  the dynamic table is not used. Buckets and chains are read in blocks, not
+  entry by entry.
+- Performance: resolving a preload line or environment name compared it with every
+  cached library path (suffix and basename matches). It is now compared only with
+  the cached paths of the same basename, from an index built once per run; the first
+  match, and so the result, is the same. Names with `$LIB`/`$PLATFORM` tokens still
+  go through the full matcher.
+- Tests: 24 new tests. The ELF ones build 32- and 64-bit, little- and big-endian images with
+  `DT_HASH`, `DT_GNU_HASH` or both and cover forged section headers, the fallback,
+  and forged dynamic data (pointers outside the file, no `DT_NULL`, huge counts,
+  endless GNU chains, `e_phnum` 65535, wrapping segments, unmappable and ambiguous
+  addresses, uncached pages in each table); one parses the shared objects of the
+  Python running the tests (its `lib-dynload` modules, libc, the loader) and expects
+  each to be read completely and consistently. Another checks the indexed library
+  lookup against the linear one on random input. The test image builder now emits
+  program headers and a dynamic segment; the existing tests that are about images
+  with section headers only build them without (`dynamic=False`).
+- CI: a job installs the minimum framework version, `volatility3==2.26.0`, on
+  Python 3.12 and runs the byte-compile, load check and unit tests against it.
+
 ## 1.7.0 (2026-11-20)
 
 - Fixed (review): the pattern deciding whether a token names a shared object

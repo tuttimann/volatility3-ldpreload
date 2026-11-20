@@ -572,9 +572,33 @@ ELF_MAGIC = b"\x7fELF"
 SHT_SYMTAB = 2
 SHT_DYNSYM = 11
 
+PT_LOAD = 1
+PT_DYNAMIC = 2
+
+DT_NULL = 0
+DT_HASH = 4
+DT_STRTAB = 5
+DT_SYMTAB = 6
+DT_STRSZ = 10
+DT_SYMENT = 11
+DT_GNU_HASH = 0x6FFFFEF5
+
+#: ELF64 machines whose DT_HASH words are 8 bytes wide (S/390, Alpha).
+ELF_HASH64_MACHINES = (22, 0x9026)
+
 STT_FUNC = 2
 STB_LOCAL = 0
 SHN_UNDEF = 0
+
+# What a forged header can make the reader walk. A real object has about ten
+# program headers, a few dozen dynamic entries and hash tables sized to its
+# symbol count; anything beyond these bounds is not read (and the symbol table
+# is then not complete).
+ELF_PHDR_MAX = 512
+ELF_DYNAMIC_MAX = 4096
+ELF_SYMBOL_MAX = 65536
+ELF_HASH_BUCKETS_MAX = 1 << 20
+ELF_BLOOM_WORDS_MAX = 1 << 20
 
 
 def _has_zero_page(
@@ -604,20 +628,93 @@ class ElfInfo:
     bits: int = 0
     #: Global FUNC symbols the object *defines*: these override libc at load time.
     exported: List[str] = field(default_factory=list)
-    #: The symbol table could not be read to its end (no section headers --
-    #: stripped, or their page not cached -- or more symbols than are parsed),
-    #: or there is no ``.dynsym`` or one of zero entries, which a real shared
-    #: object does not have and forged section headers can claim. ``exported``
-    #: is then not the whole truth and an empty list proves nothing.
+    #: The symbol table could not be read to its end through the dynamic
+    #: segment -- the way the loader finds it: no readable ``PT_DYNAMIC`` or
+    #: hash table (forged, or its page not cached; only the section headers
+    #: were left to go by), a page of the tables not cached, more symbols than
+    #: are parsed, or section headers that disagree with it. ``exported`` is
+    #: then not the whole truth and an empty list proves nothing.
     incomplete: bool = False
+    #: Where ``exported`` comes from: "dynamic" (``PT_DYNAMIC``), "sections"
+    #: (the ``.dynsym`` / ``.symtab`` section-header fallback) or "".
+    source: str = ""
+    #: Anomalies worth a note in the row (section headers disagreeing with the
+    #: dynamic segment, contradicting hash tables, ...).
+    notes: List[str] = field(default_factory=list)
 
     def interposed(self) -> List[str]:
         """Exported functions that shadow a libc function of interest."""
         return [name for name in self.exported if name in INTERPOSED_LIBC_FUNCTIONS]
 
 
+@dataclass
+class _SymbolTable:
+    """Where a symbol table lies in the file image, and how much of it to read."""
+
+    offset: int
+    #: Entries to read (``total`` capped at ``ELF_SYMBOL_MAX``).
+    count: int
+    #: Entries the table declares.
+    total: int
+    entry_size: int
+    str_offset: int
+    str_size: int
+    #: ``total`` is the whole table and every structure describing it was read
+    #: without a contradiction or an uncached page.
+    complete: bool = True
+    #: ``total`` is exact; False for a GNU hash table that hashes no symbol
+    #: (its symoffset is only a lower bound) without a DT_HASH to settle it.
+    exact: bool = True
+
+
+class _AddressMap:
+    """Virtual address -> file offset through the ``PT_LOAD`` segments' file
+    parts, the way the loader maps the object."""
+
+    def __init__(self, loads: List[Tuple[int, int, int]], bits: int) -> None:
+        limit = 1 << bits
+        # A segment whose file part wraps the address space or the file offset
+        # range is forged; it maps nothing.
+        self._loads = [
+            (vaddr, offset, filesz)
+            for vaddr, offset, filesz in loads
+            if vaddr + filesz <= limit and offset + filesz <= limit
+        ]
+        #: Some address mapped to more than one file offset.
+        self.ambiguous = False
+
+    def offset(self, address: int, size: int) -> Optional[Tuple[int, int]]:
+        """``(file offset of address, file offset where its segment's file
+        part ends)`` if ``[address, address + size)`` lies within one segment's
+        file part and every segment holding it agrees on the offset; else None."""
+        if size < 0:
+            return None
+        hits = {
+            (offset + address - vaddr, offset + filesz)
+            for vaddr, offset, filesz in self._loads
+            if vaddr <= address and address + size <= vaddr + filesz
+        }
+        if len({start for start, _ in hits}) > 1:
+            # Overlapping segments with different contents: the loader maps
+            # the later one over the earlier, a first-match parser would read
+            # a decoy. Neither is trusted.
+            self.ambiguous = True
+            return None
+        if not hits:
+            return None
+        return min(hits, key=lambda hit: hit[1])
+
+
 class ElfReader:
-    """Parses just enough ELF to describe a shared object recovered from memory."""
+    """Parses just enough ELF to describe a shared object recovered from memory.
+
+    The symbol table is located the way the loader locates it: through the
+    program headers' ``PT_DYNAMIC`` segment (``DT_SYMTAB``, ``DT_STRTAB``,
+    ``DT_STRSZ``) and the symbol count of its hash table (``DT_GNU_HASH``,
+    ``DT_HASH``). Section headers, which the loader never reads and anyone can
+    rewrite, are only a fallback for an object without a readable dynamic
+    segment -- never a complete read -- and otherwise a cross-check whose
+    disagreement is noted and makes the read incomplete."""
 
     @classmethod
     def parse(cls, data: bytes) -> ElfInfo:
@@ -636,24 +733,314 @@ class ElfReader:
         info.incomplete = True
 
         try:
+            e_machine = struct.unpack_from(endian + "H", data, 18)[0]
             if info.bits == 64:
-                e_shoff = struct.unpack_from(endian + "Q", data, 40)[0]
-                e_shentsize, e_shnum = struct.unpack_from(endian + "HH", data, 58)
+                e_phoff, e_shoff = struct.unpack_from(endian + "QQ", data, 32)
+                e_phentsize, e_phnum, e_shentsize, e_shnum = struct.unpack_from(
+                    endian + "HHHH", data, 54
+                )
             else:
-                e_shoff = struct.unpack_from(endian + "I", data, 32)[0]
-                e_shentsize, e_shnum = struct.unpack_from(endian + "HH", data, 46)
+                e_phoff, e_shoff = struct.unpack_from(endian + "II", data, 28)
+                e_phentsize, e_phnum, e_shentsize, e_shnum = struct.unpack_from(
+                    endian + "HHHH", data, 42
+                )
         except struct.error:
             return info
 
-        if not e_shoff or not e_shnum:
+        sections = (
+            cls._sections(data, endian, info.bits, e_shoff, e_shentsize, e_shnum)
+            if e_shoff and e_shnum
+            else []
+        )
+        section_table, section_is_dynsym = cls._section_table(
+            data, info.bits, sections
+        )
+
+        dynamic = cls._dynamic_table(
+            data, endian, info.bits, e_machine, e_phoff, e_phentsize, e_phnum, info.notes
+        )
+        if dynamic is None:
+            # Fallback: what the section headers claim. Never a complete
+            # read -- the loader does not go by them.
+            if section_table is not None:
+                info.exported, _ = cls._walk_symbols(
+                    data, endian, info.bits, section_table
+                )
+                info.source = "sections"
             return info
 
-        sections = cls._sections(data, endian, info.bits, e_shoff, e_shentsize, e_shnum)
-        if not sections:
-            return info
-
-        cls._read_symbols(data, endian, info, sections)
+        info.exported, read_all = cls._walk_symbols(data, endian, info.bits, dynamic)
+        info.source = "dynamic"
+        complete = dynamic.complete and read_all and dynamic.count > 0
+        # The cross-check needs section headers that were actually recovered;
+        # a header table past the end of the recovered content or on an
+        # uncached page says nothing, and is not a disagreement.
+        if cls._headers_recovered(data, info.bits, e_shoff, e_shentsize, e_shnum):
+            disagreement = cls._disagreement(
+                data,
+                endian,
+                info.bits,
+                dynamic,
+                info.exported,
+                section_table if section_is_dynsym else None,
+            )
+            if disagreement:
+                info.notes.append(
+                    "section headers disagree with the dynamic segment ("
+                    + disagreement
+                    + ")"
+                )
+                complete = False
+        info.incomplete = not complete
         return info
+
+    @staticmethod
+    def _headers_recovered(
+        data: bytes, bits: int, shoff: int, shentsize: int, shnum: int
+    ) -> bool:
+        """Whether the whole section header table is in ``data``, uncut and
+        on no uncached (zero) page."""
+        if not shoff or not shnum or shentsize < (64 if bits == 64 else 40):
+            return False
+        end = shoff + shnum * shentsize
+        return end <= len(data) and not _has_zero_page(data, shoff, end)
+
+    @staticmethod
+    def _program_headers(
+        data: bytes, endian: str, bits: int, phoff: int, phentsize: int, phnum: int
+    ) -> List[Tuple[int, int, int, int]]:
+        """``(p_type, p_offset, p_vaddr, p_filesz)`` per program header; empty
+        if the table is absent, implausible or not wholly recovered."""
+        if not phoff or not phnum or phnum > ELF_PHDR_MAX:
+            return []
+        if phentsize < (56 if bits == 64 else 32):
+            return []
+        if phoff + phnum * phentsize > len(data):
+            return []
+        headers = []
+        for index in range(phnum):
+            base = phoff + index * phentsize
+            if bits == 64:
+                p_type, _, p_offset, p_vaddr, _, p_filesz = struct.unpack_from(
+                    endian + "IIQQQQ", data, base
+                )
+            else:
+                p_type, p_offset, p_vaddr, _, p_filesz = struct.unpack_from(
+                    endian + "IIIII", data, base
+                )
+            headers.append((p_type, p_offset, p_vaddr, p_filesz))
+        return headers
+
+    @classmethod
+    def _dynamic_table(
+        cls,
+        data: bytes,
+        endian: str,
+        bits: int,
+        machine: int,
+        phoff: int,
+        phentsize: int,
+        phnum: int,
+        notes: List[str],
+    ) -> Optional[_SymbolTable]:
+        """The dynamic symbol table as the loader finds it, or None if the
+        dynamic segment or what it points to cannot be read. Anomalies are
+        appended to ``notes``."""
+        headers = cls._program_headers(data, endian, bits, phoff, phentsize, phnum)
+        if phnum > ELF_PHDR_MAX:
+            notes.append(f"implausible program header count {phnum}")
+        dynamics = [header for header in headers if header[0] == PT_DYNAMIC]
+        if not dynamics:
+            return None
+        if len(dynamics) > 1:
+            notes.append(f"{len(dynamics)} PT_DYNAMIC program headers")
+            return None
+        amap = _AddressMap(
+            [(vaddr, offset, filesz) for kind, offset, vaddr, filesz in headers if kind == PT_LOAD],
+            bits,
+        )
+        try:
+            table = cls._read_dynamic(data, endian, bits, machine, dynamics[0][2], amap, notes)
+        except struct.error:
+            table = None
+        if amap.ambiguous:
+            notes.append("overlapping PT_LOAD segments map a dynamic table ambiguously")
+            return None
+        return table
+
+    @classmethod
+    def _read_dynamic(
+        cls,
+        data: bytes,
+        endian: str,
+        bits: int,
+        machine: int,
+        dynamic_vaddr: int,
+        amap: _AddressMap,
+        notes: List[str],
+    ) -> Optional[_SymbolTable]:
+        entry = 16 if bits == 64 else 8
+        found = amap.offset(dynamic_vaddr, entry)
+        if found is None:
+            return None
+        start, segment_end = found
+        limit = min(segment_end, len(data))
+        tags: Dict[int, int] = {}
+        terminated = False
+        # The loader reads entries until DT_NULL; a later duplicate tag
+        # overrides an earlier one, as in glibc.
+        for index in range(ELF_DYNAMIC_MAX):
+            base = start + index * entry
+            if base + entry > limit:
+                break
+            tag, value = struct.unpack_from(
+                endian + ("qQ" if bits == 64 else "iI"), data, base
+            )
+            if tag == DT_NULL:
+                terminated = True
+                break
+            tags[tag] = value
+        if not terminated:
+            notes.append("dynamic segment has no DT_NULL terminator")
+            return None
+
+        sym_size = 24 if bits == 64 else 16
+        if DT_SYMTAB not in tags or DT_STRTAB not in tags or DT_STRSZ not in tags:
+            return None
+        if tags.get(DT_SYMENT, sym_size) != sym_size:
+            notes.append(f"DT_SYMENT {tags[DT_SYMENT]} is not {sym_size}")
+            return None
+        strings = amap.offset(tags[DT_STRTAB], tags[DT_STRSZ])
+        if strings is None:
+            return None
+        str_offset, str_size = strings[0], tags[DT_STRSZ]
+
+        ranges: List[Tuple[int, int]] = []
+        gnu = sysv = None
+        if DT_GNU_HASH in tags:
+            gnu = cls._gnu_hash_count(data, endian, bits, amap, tags[DT_GNU_HASH])
+        if DT_HASH in tags:
+            word = 8 if bits == 64 and machine in ELF_HASH64_MACHINES else 4
+            sysv = cls._sysv_hash_count(data, endian, word, amap, tags[DT_HASH])
+
+        complete, exact = True, True
+        if gnu is not None:
+            total, exact, hash_range = gnu
+            ranges.append(hash_range)
+            if sysv is not None:
+                ranges.append(sysv[1])
+                if not exact:
+                    # A GNU table hashing no symbol only bounds the count from
+                    # below; DT_HASH counts every symbol.
+                    if sysv[0] < total:
+                        notes.append(
+                            f"DT_HASH counts {sysv[0]} symbols, fewer than the "
+                            f"{total} DT_GNU_HASH skips"
+                        )
+                        complete = False
+                    total, exact = max(total, sysv[0]), True
+                elif sysv[0] != total:
+                    notes.append(
+                        f"DT_HASH and DT_GNU_HASH disagree on the symbol count "
+                        f"({sysv[0]} vs {total})"
+                    )
+                    total, complete = max(total, sysv[0]), False
+            elif DT_HASH in tags:
+                complete = False
+        elif sysv is not None:
+            total, hash_range = sysv
+            ranges.append(hash_range)
+            # The loader would use a DT_GNU_HASH that is present; one that
+            # cannot be read leaves the count unconfirmed.
+            complete = DT_GNU_HASH not in tags
+        else:
+            return None
+
+        count = min(total, ELF_SYMBOL_MAX)
+        if count < total:
+            complete = False
+        symbols = amap.offset(tags[DT_SYMTAB], count * sym_size)
+        if symbols is None:
+            return None
+        sym_offset = symbols[0]
+        ranges.append((sym_offset, sym_offset + count * sym_size))
+        ranges.append((str_offset, str_offset + str_size))
+        # A page of any of these tables that was not cached reads as zeros:
+        # null symbols, empty names, empty hash chains.
+        if any(_has_zero_page(data, low, high) for low, high in ranges):
+            complete = False
+        return _SymbolTable(
+            offset=sym_offset,
+            count=count,
+            total=total,
+            entry_size=sym_size,
+            str_offset=str_offset,
+            str_size=str_size,
+            complete=complete,
+            exact=exact,
+        )
+
+    @staticmethod
+    def _sysv_hash_count(
+        data: bytes, endian: str, word: int, amap: _AddressMap, address: int
+    ) -> Optional[Tuple[int, Tuple[int, int]]]:
+        """``(nchain, table range)`` of a DT_HASH table wholly in ``data``.
+        nchain is the number of symbols in the dynamic symbol table."""
+        found = amap.offset(address, 2 * word)
+        if found is None:
+            return None
+        start, segment_end = found
+        fmt = endian + ("QQ" if word == 8 else "II")
+        nbucket, nchain = struct.unpack_from(fmt, data, start)
+        if nbucket > ELF_HASH_BUCKETS_MAX:
+            return None
+        end = start + word * (2 + nbucket + nchain)
+        if end > min(segment_end, len(data)):
+            # Not all of it is in the file image (a huge nchain, or a cut).
+            return None
+        return nchain, (start, end)
+
+    @staticmethod
+    def _gnu_hash_count(
+        data: bytes, endian: str, bits: int, amap: _AddressMap, address: int
+    ) -> Optional[Tuple[int, bool, Tuple[int, int]]]:
+        """``(symbol count, exact, table range)`` from a DT_GNU_HASH table:
+        one past the end of the chain the highest bucket starts. If no bucket
+        is used the count is symoffset, which is only a lower bound."""
+        found = amap.offset(address, 16)
+        if found is None:
+            return None
+        start, segment_end = found
+        end = min(segment_end, len(data))
+        nbuckets, symoffset, bloom_size, _ = struct.unpack_from(
+            endian + "IIII", data, start
+        )
+        if not 0 < nbuckets <= ELF_HASH_BUCKETS_MAX or bloom_size > ELF_BLOOM_WORDS_MAX:
+            return None
+        buckets_at = start + 16 + bloom_size * (8 if bits == 64 else 4)
+        chain_at = buckets_at + 4 * nbuckets
+        if chain_at > end:
+            return None
+        top = max(struct.unpack_from(f"{endian}{nbuckets}I", data, buckets_at))
+        if top == 0:
+            return symoffset, False, (start, chain_at)
+        if top < symoffset:
+            return None
+        position = chain_at + 4 * (top - symoffset)
+        # The chain of the last bucket ends at the first odd word; walked at
+        # most one entry beyond the symbol cap.
+        words = min(end - position, 4 * (ELF_SYMBOL_MAX + 1)) // 4
+        if words <= 0:
+            return None
+        chain = struct.unpack_from(f"{endian}{words}I", data, position)
+        for step, value in enumerate(chain):
+            if value & 1:
+                return top + step + 1, True, (start, position + 4 * (step + 1))
+        if words > ELF_SYMBOL_MAX:
+            # Longer than anything parsed: the count exceeds the cap.
+            return top + words + 1, True, (start, position + 4 * words)
+        # The chain runs off the recovered content without an end.
+        return None
 
     @staticmethod
     def _sections(
@@ -761,76 +1148,116 @@ class ElfReader:
             end = min(len(data), start + 256)
         return data[start:end].decode("utf-8", "replace")
 
-    @classmethod
-    def _read_symbols(cls, data: bytes, endian: str, info: ElfInfo, sections) -> None:
-        """Collects the global FUNC symbols the object defines (exports).
+    @staticmethod
+    def _section_table(
+        data: bytes, bits: int, sections
+    ) -> Tuple[Optional[_SymbolTable], bool]:
+        """The symbol table the section headers describe, and whether it is
+        ``.dynsym``.
 
         Only ``.dynsym`` governs symbol interposition -- ``.symtab`` (if present at
         all in a shipped ``.so``) lists build-time symbols the loader never consults --
-        so the dynamic table is used when available and the static one is only a
-        fallback for an object that has no ``.dynsym``. That fallback, and a
-        table of zero entries, never count as a complete read: section headers
-        are not what the loader goes by, and whoever wrote the file can leave
-        ``.dynsym`` out or declare it empty (the dynamic segment, which would
-        settle it, is not parsed).
+        so ``.symtab`` only stands in for an object that has no ``.dynsym``.
         """
         dynsym = [s for s in sections if s[0] == SHT_DYNSYM]
         symtab = [s for s in sections if s[0] == SHT_SYMTAB]
         chosen = dynsym[0] if dynsym else (symtab[0] if symtab else None)
         if chosen is None:
-            return
-
+            return None, False
         _sh_type, sh_offset, sh_size, sh_link, sh_entsize = chosen
         if sh_link >= len(sections):
-            return
+            return None, False
         _, str_offset, str_size, _, _ = sections[sh_link]
-        entry_size = sh_entsize or (24 if info.bits == 64 else 16)
+        entry_size = sh_entsize or (24 if bits == 64 else 16)
         if entry_size <= 0:
-            return
-
-        exported: List[str] = []
-
+            return None, False
         total = sh_size // entry_size
-        count = min(total, 65536)
-        # A page of either table that was not cached reads as zeros: null
-        # symbols and empty names, which would pass for "defines nothing".
-        complete = bool(dynsym) and 0 < count == total and not (
-            _has_zero_page(data, sh_offset, sh_offset + sh_size)
-            or _has_zero_page(data, str_offset, str_offset + str_size)
+        return (
+            _SymbolTable(
+                offset=sh_offset,
+                count=min(total, ELF_SYMBOL_MAX),
+                total=total,
+                entry_size=entry_size,
+                str_offset=str_offset,
+                str_size=str_size,
+            ),
+            bool(dynsym),
         )
-        for index in range(count):
-            base = sh_offset + index * entry_size
+
+    @classmethod
+    def _walk_symbols(
+        cls, data: bytes, endian: str, bits: int, table: _SymbolTable
+    ) -> Tuple[List[str], bool]:
+        """The global FUNC symbols ``table`` defines (exports), and whether all
+        ``table.count`` entries were in ``data``."""
+        exported: Set[str] = set()
+        entry_size = table.entry_size
+        if entry_size <= 0:
+            return [], False
+        for index in range(table.count):
+            base = table.offset + index * entry_size
             if base + entry_size > len(data):
-                complete = False
-                break
+                return sorted(exported), False
             try:
                 st_name = struct.unpack_from(endian + "I", data, base)[0]
-                if info.bits == 64:
+                if bits == 64:
                     st_info = data[base + 4]
                     st_shndx = struct.unpack_from(endian + "H", data, base + 6)[0]
                 else:
                     st_info = data[base + 12]
                     st_shndx = struct.unpack_from(endian + "H", data, base + 14)[0]
             except (struct.error, IndexError):
-                complete = False
-                break
-
-            name = cls._string_at(data, str_offset, str_size, st_name)
-            if not name:
-                continue
-            # Strip the GLIBC_2.x version suffix so names compare cleanly.
-            name = name.split("@", 1)[0]
+                return sorted(exported), False
 
             if st_shndx == SHN_UNDEF:
                 # An undefined entry is an import, not a definition.
                 continue
             # Only global/weak FUNC definitions participate in symbol interposition;
             # local symbols never shadow libc.
-            if (st_info & 0xF) == STT_FUNC and (st_info >> 4) != STB_LOCAL:
-                exported.append(name)
+            if (st_info & 0xF) != STT_FUNC or (st_info >> 4) == STB_LOCAL:
+                continue
+            name = cls._string_at(data, table.str_offset, table.str_size, st_name)
+            if name:
+                # Strip the GLIBC_2.x version suffix so names compare cleanly.
+                exported.add(name.split("@", 1)[0])
+        return sorted(exported), True
 
-        info.exported = sorted(set(exported))
-        info.incomplete = not complete
+    @classmethod
+    def _disagreement(
+        cls,
+        data: bytes,
+        endian: str,
+        bits: int,
+        dynamic: _SymbolTable,
+        exported: List[str],
+        dynsym: Optional[_SymbolTable],
+    ) -> str:
+        """How the recovered section headers' ``.dynsym`` contradicts the
+        dynamic segment, or "" if it does not."""
+        if dynsym is None:
+            return "no .dynsym"
+        parts = []
+        if dynsym.offset != dynamic.offset:
+            parts.append(f".dynsym at {dynsym.offset:#x}, not {dynamic.offset:#x}")
+        if dynamic.exact and dynsym.total != dynamic.total:
+            parts.append(f".dynsym has {dynsym.total} symbols, not {dynamic.total}")
+        listed = set(cls._walk_symbols(data, endian, bits, dynsym)[0])
+        if listed != set(exported):
+
+            def some(names: Set[str]) -> str:
+                shown = sorted(names)[:5]
+                more = len(names) - len(shown)
+                return ", ".join(shown) + (f" (+{more} more)" if more > 0 else "")
+
+            only_dynamic = set(exported) - listed
+            only_sections = listed - set(exported)
+            detail = []
+            if only_dynamic:
+                detail.append(f"only in the dynamic segment: {some(only_dynamic)}")
+            if only_sections:
+                detail.append(f"only in .dynsym: {some(only_sections)}")
+            parts.append("other exported functions, " + "; ".join(detail))
+        return "; ".join(parts)
 
 
 # -- page cache access -----------------------------------------------------------
@@ -1423,7 +1850,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
     """Recovers ld.so.preload from the page cache and reports the libc functions its libraries override."""
 
     _required_framework_version = (2, 26, 0)
-    _version = (1, 7, 0)
+    _version = (1, 8, 0)
 
     @classmethod
     def get_requirements(cls) -> List[interfaces.configuration.RequirementInterface]:
@@ -2067,9 +2494,12 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
         # inode is read and parsed once and the result shared. None marks an inode
         # that failed the smear check, so it is not re-checked per entry.
         analysed: Dict[int, Optional[Tuple[RecoveredFile, ElfInfo]]] = {}
+        # Built once: every preload line and environment name is resolved
+        # against it (``libraries`` does not change from here on).
+        by_basename = self._basename_index(libraries)
 
         def analyse(entry: PreloadEntry) -> None:
-            resolved = self._lookup(entry.library, libraries)
+            resolved = self._lookup(entry.library, libraries, by_basename)
             if resolved is None:
                 return
             lib_path, inode_addr = resolved
@@ -2856,8 +3286,21 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             name = name.replace(token, value)
         return name
 
+    @staticmethod
+    def _basename_index(
+        libraries: Dict[str, int]
+    ) -> Dict[str, List[Tuple[str, int]]]:
+        """``libraries`` grouped by basename, each group in the dict's order."""
+        index: Dict[str, List[Tuple[str, int]]] = {}
+        for path, inode_addr in libraries.items():
+            index.setdefault(path.rsplit("/", 1)[-1], []).append((path, inode_addr))
+        return index
+
     def _lookup(
-        self, name: str, libraries: Dict[str, int]
+        self,
+        name: str,
+        libraries: Dict[str, int],
+        by_basename: Optional[Dict[str, List[Tuple[str, int]]]] = None,
     ) -> Optional[Tuple[str, int]]:
         """Resolves a preload entry to a cached (path, inode address).
 
@@ -2865,7 +3308,15 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
         dynamic-string tokens ($PLATFORM/$LIB): the concrete value is tried first,
         and a token that cannot be pinned down is matched as ``[^/]+`` so the entry
         still resolves to the real cached object regardless of the expanded value.
+
+        ``by_basename`` is ``_basename_index(libraries)``; a caller resolving many
+        names passes it once built. A suffix match and a basename match can only
+        be found among the paths of the same basename, so each name is compared
+        with those instead of with every cached path; the groups keep the order
+        of ``libraries``, so the first match is the same.
         """
+        if by_basename is None:
+            by_basename = self._basename_index(libraries)
         candidates = [name]
         expanded = self._expand_tokens(name)
         if expanded != name:
@@ -2876,8 +3327,10 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             # A container's file appears under its mountpoint, and /bin is a symlink
             # to /usr/bin; a leading-'/' suffix match accepts both while '/lib/foo.so'
             # still cannot match '/evillib/foo.so'.
-            for path, inode_addr in libraries.items():
-                if path.endswith(candidate) and candidate.startswith("/"):
+            if not candidate.startswith("/"):
+                continue
+            for path, inode_addr in by_basename.get(candidate.rsplit("/", 1)[-1], ()):
+                if path.endswith(candidate):
                     return path, inode_addr
         if DYNAMIC_TOKEN_RE.search(name):
             regex = self._token_suffix_regex(name)
@@ -2889,11 +3342,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             # relative ./build/foo.so (relative to the exporting shell's cwd):
             # resolved by basename, a system library directory preferred.
             basename = name.rsplit("/", 1)[-1]
-            matches = [
-                (path, inode_addr)
-                for path, inode_addr in libraries.items()
-                if path.rsplit("/", 1)[-1] == basename
-            ]
+            matches = list(by_basename.get(basename, ()))
             if matches:
                 matches.sort(key=lambda m: (not m[0].startswith(SYSTEM_LIB_DIRS), m[0]))
                 return matches[0]
@@ -3329,11 +3778,19 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                     # "None" only if the whole symbol table was read; otherwise
                     # the list is unknown, not empty.
                     hooks = na() if elf.incomplete else nap()
+                notes.extend(elf.notes)
                 if elf.incomplete:
                     notes.append(
-                        "symbol table not fully readable (section headers stripped, "
-                        "not cached or beyond the read budget, or no or an empty "
-                        ".dynsym); the overridden functions are "
+                        "symbol table not fully readable ("
+                        + (
+                            "section headers only, no readable dynamic segment"
+                            if elf.source == "sections"
+                            else "no readable dynamic segment or section headers"
+                            if not elf.source
+                            else "dynamic segment not fully cached, beyond the "
+                            "read budget or contradicted"
+                        )
+                        + "); the overridden functions are "
                         + ("incomplete" if functions else "unknown")
                     )
                 if not functions and entry.env_var and elf.exported:
