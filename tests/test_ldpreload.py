@@ -17,7 +17,11 @@ import contextlib
 import datetime
 import importlib.util
 import pathlib
+import random
+import re
+import signal
 import struct
+import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -57,6 +61,8 @@ def make_plugin(config=None, **attrs):
     plugin._limit = 0
     plugin._platform = "x86_64"
     plugin._libdir = "lib64"
+    plugin._read_total = 0
+    plugin._read_total_warned = False
     for name, value in attrs.items():
         setattr(plugin, name, value)
     return plugin
@@ -69,7 +75,9 @@ STB_LOCAL, STB_GLOBAL, STB_WEAK = 0, 1, 2
 SHT_PROGBITS, SHT_STRTAB, SHT_DYNSYM = 1, 3, 11
 
 
-def build_elf(symbols, bits=64, rodata=b"", shentsize=None, truncate_at=None):
+def build_elf(
+    symbols, bits=64, rodata=b"", shentsize=None, truncate_at=None, strip_sections=False
+):
     """A shared-object image with .dynstr, .dynsym, .rodata and .shstrtab.
 
     ``symbols`` is a list of ``(name, type, binding, defined)``.
@@ -79,13 +87,13 @@ def build_elf(symbols, bits=64, rodata=b"", shentsize=None, truncate_at=None):
     shdr_size = 64 if bits == 64 else 40
     ehdr_size = 64 if bits == 64 else 52
 
-    dynstr = b"\x00"
+    dynstr = bytearray(b"\x00")  # bytearrays: one test builds 65537 symbols
     name_offsets = []
     for name, *_ in symbols:
         name_offsets.append(len(dynstr))
         dynstr += name.encode() + b"\x00"
 
-    dynsym = b"\x00" * sym_size  # the mandatory null symbol
+    dynsym = bytearray(sym_size)  # the mandatory null symbol
     for (name, sym_type, binding, defined), name_off in zip(symbols, name_offsets):
         info = (binding << 4) | sym_type
         shndx = 3 if defined else 0  # .rodata or SHN_UNDEF
@@ -133,6 +141,10 @@ def build_elf(symbols, bits=64, rodata=b"", shentsize=None, truncate_at=None):
     )
     shnum = 5
     shentsize = shdr_size if shentsize is None else shentsize
+    if strip_sections:
+        # What sstrip leaves: no section header table at all. The loader does
+        # not need one (it works from PT_DYNAMIC), so the object still loads.
+        headers, shoff, shnum = b"", 0, 0
 
     ident = b"\x7fELF" + bytes([2 if bits == 64 else 1, 1, 1, 0]) + b"\x00" * 8
     if bits == 64:
@@ -267,6 +279,35 @@ class PreloadFileTests(unittest.TestCase):
         self.assertEqual(split(""), [])
         self.assertEqual(split(":"), [])
 
+    def test_split_preload_value_like_the_loader(self):
+        # glibc splits LD_PRELOAD at " :" and LD_AUDIT at ":" only; a tab or a
+        # newline (or, for LD_AUDIT, a space) is part of the object's name.
+        split = ldpreload.LdPreload._split_preload_value
+        self.assertEqual(split("/tmp/a\tb.so:/c.so", "LD_PRELOAD"), ["/tmp/a\tb.so", "/c.so"])
+        self.assertEqual(split("/tmp/a\nb.so /c.so", "LD_PRELOAD"), ["/tmp/a\nb.so", "/c.so"])
+        self.assertEqual(split("/tmp/my lib.so:/c.so", "LD_AUDIT"), ["/tmp/my lib.so", "/c.so"])
+
+    def test_parse_separators_and_comments_like_the_loader(self):
+        parse = ldpreload.LdPreload._parse_preload
+        looks = ldpreload.LdPreload._looks_like_preload
+        # A colon separates entries, as it does for the loader.
+        self.assertEqual(parse(b"/lib/a.so:/lib/b.so\n"), ["/lib/a.so", "/lib/b.so"])
+        self.assertTrue(looks(b"/lib/a.so:/lib/b.so\n"))
+        # A comment starts at any '#', not only at the start of a line.
+        self.assertEqual(
+            parse(b"/lib/c.so#x\n/lib/d.so # note here\n  # whole line\n/lib/e.so"),
+            ["/lib/c.so", "/lib/d.so", "/lib/e.so"],
+        )
+        self.assertTrue(looks(b"/lib/c.so#/etc/passwd\n"))
+        self.assertTrue(looks(b"/lib/d.so # loaded by the vendor agent\n"))
+        self.assertFalse(looks(b"# /lib/only-a-comment.so\n"))
+        # Only " \t\n:" separate: other whitespace belongs to the name.
+        self.assertEqual(
+            parse("/lib/evil x.so\n/lib/a\x0bb.so\r\n".encode()),
+            ["/lib/evil x.so", "/lib/a\x0bb.so\r"],
+        )
+        self.assertTrue(looks("/lib/evil x.so\n".encode()))
+
     def test_preload_vars_from_environment_block(self):
         block = (
             b"PATH=/usr/bin\x00LD_PRELOAD=/tmp/x.so:/tmp/y.so\x00XLD_PRELOAD=/no\x00"
@@ -395,11 +436,27 @@ class EnvironmentAssessmentTests(unittest.TestCase):
         self.assertEqual(kept.reasons, ["not named like a shared object"])
 
     def test_vendor_wrapper_in_system_dir_is_assumed_safe(self):
-        entry = self.entry("/opt/splunkforwarder/lib/libdlwrapper.so")
+        path = "/opt/splunkforwarder/lib/libdlwrapper.so"
+        entry = self.entry(path, path, ["dlopen_wrapper"])
         (kept,) = self.assess(entry)
         self.assertTrue(kept.benign)
         self.assertEqual(kept.reasons, [])
         self.assertEqual(self.assess(entry, **{"filter-safe-env": True}), [])
+
+    def test_unanalysed_system_library_is_not_assumed_safe(self):
+        # Nothing of the library was seen: not cached at all ...
+        path = "/usr/lib64/libquiet.so"
+        entry = self.entry(path)
+        (kept,) = self.assess(entry, **{"filter-safe-env": True})
+        self.assertFalse(kept.benign)
+        # ... or recovered without a readable symbol table (stripped section
+        # headers, or their page not cached). Neither is hidden as safe.
+        entry = self.entry(path, path)
+        entry.elf = ldpreload.ElfReader.parse(build_elf([], strip_sections=True))
+        self.assertTrue(entry.elf.valid and entry.elf.incomplete)
+        (kept,) = self.assess(entry, **{"filter-safe-env": True})
+        self.assertFalse(kept.benign)
+        self.assertEqual(kept.reasons, [])
 
     def test_known_preload_overriding_libc_is_assumed_safe_only_in_system_dir(self):
         entry = self.entry("/usr/lib64/libjemalloc.so.2", "/usr/lib64/libjemalloc.so.2", ["open", "read"])
@@ -508,6 +565,46 @@ class LoaderTests(unittest.TestCase):
         self.assertFalse(zero(b"x" * 4096 + b"\x00" * 4095))
         self.assertFalse(zero(b""))
 
+    def test_zero_page_is_found_in_an_unaligned_section(self):
+        # .rodata from 0x240 to 0x2800; the file page 0x1000-0x2000 inside it is
+        # a hole. Chunks counted from 0x240 would each be part data, part hole.
+        zero = ldpreload.LdPreload._has_zero_page
+        data = b"x" * 0x1000 + b"\x00" * 0x1000 + b"z" * 0x1000
+        self.assertTrue(zero(data, 0x240, 0x2800))
+        # A hole outside the section does not count, a partly zero page neither.
+        self.assertFalse(zero(data, 0x2000, 0x3000))
+        self.assertFalse(zero(b"x" * 0x1000 + b"\x00" * 0xFFF + b"z" * 0x1001, 0x240, 0x2800))
+        # Out-of-range bounds from a hostile section header are clamped.
+        self.assertFalse(zero(data, 1 << 60, 1 << 61))
+        self.assertTrue(zero(data, 0, 1 << 62))
+
+    def test_truncated_or_holed_loader_is_inconclusive_not_patched(self):
+        rodata = (b"\x00/etc/ld.so.cache\x00" + b"r" * 0x2000).ljust(0x3000, b"r")
+        elf = build_elf([], rodata=rodata)
+        # Without section headers .rodata cannot be located: a cut is undecided.
+        bare = build_elf([], rodata=rodata, strip_sections=True)
+        kernel = FakeKernel({7: elf})
+        for label, content, truncated, expected in (
+            ("whole", elf, False, "patched"),
+            ("cut after a complete .rodata", elf, True, "patched"),
+            ("cut, .rodata not locatable", bare, True, "inconclusive"),
+        ):
+            with self.subTest(label):
+                plugin = kernel.plugin()
+
+                def read(context, module, inode, path, max_size=None, limit=None):
+                    self.assertEqual(limit, ldpreload.LOADER_MAX_SIZE)
+                    return ldpreload.RecoveredFile(
+                        path=path, inode_addr=7, data=content, truncated=truncated
+                    )
+
+                with mock.patch.object(ldpreload, "read_inode", side_effect=read), \
+                        mock.patch.object(ldpreload, "vollog"):
+                    (check,) = plugin._check_loaders(
+                        "kernel", {"/usr/lib64/ld-2.17.so": 7}, {}
+                    )
+                self.assertEqual(check.state, expected)
+
 
 class FakeKernel:
     """A stand-in for the kernel module: ``files`` maps inode address to content.
@@ -534,7 +631,7 @@ class FakeKernel:
             vol=SimpleNamespace(offset=offset), is_valid=lambda: True, i_size=size
         )
 
-    def read(self, context, module_name, inode, path, max_size=None):
+    def read(self, context, module_name, inode, path, max_size=None, limit=None):
         self.reads.append(path)
         self.bounds.append(max_size)
         return ldpreload.RecoveredFile(
@@ -1130,6 +1227,831 @@ class RenderingTests(unittest.TestCase):
             self.assertEqual(len(line), 20)
             self.assertLessEqual(len(line.rstrip()), 20)
         self.assertEqual(plugin._wrap("short", 48), "short")
+
+
+@contextlib.contextmanager
+def deadline(seconds):
+    """Fails the enclosed block instead of letting it run on: a regex that
+    backtracks catastrophically would otherwise hang the suite, not fail it."""
+    if not hasattr(signal, "SIGALRM"):  # pragma: no cover - not on Windows
+        yield
+        return
+
+    def expired(signum, frame):
+        raise AssertionError(f"still running after {seconds} s")
+
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+@unittest.skipUnless(HAVE_FRAMEWORK, "volatility3 is not importable")
+class HostileInputTests(unittest.TestCase):
+    """Patterns and parsers fed with what a user of the imaged system controls:
+    file content, file names and environment values."""
+
+    def test_so_token_does_not_backtrack_exponentially(self):
+        # One line of a 4 KiB file anywhere in the page cache.
+        content = b"/x.so" + b".a" * 1000 + b"/z\n"
+        with deadline(10):
+            self.assertFalse(ldpreload.LdPreload._looks_like_preload(content))
+            self.assertFalse(ldpreload.SO_TOKEN_RE.search(".so" * 1300 + "/"))
+
+    def test_token_matcher_agrees_with_the_regex_it_replaces(self):
+        def reference(name):
+            parts, last = [], 0
+            for match in ldpreload.DYNAMIC_TOKEN_RE.finditer(name):
+                parts.append(re.escape(name[last : match.start()]))
+                parts.append(r"[^/]+")
+                last = match.end()
+            parts.append(re.escape(name[last:]))
+            return re.compile("".join(parts) + r"\Z")
+
+        rng = random.Random(1707)
+        pieces = ["$LIB", "${PLATFORM}", "$ORIGIN", "/", "a", "b", ".", "ab", "/a"]
+        checked = matched = 0
+        for _ in range(4000):
+            name = "".join(rng.choice(pieces) for _ in range(rng.randint(1, 6)))
+            if name.count("$") > ldpreload._TokenSuffixMatcher.MAX_TOKENS:
+                continue
+            path = "".join(rng.choice("ab./") for _ in range(rng.randint(0, 9)))
+            expected = bool(reference(name).search(path))
+            got = ldpreload.LdPreload._token_suffix_regex(name).search(path)
+            self.assertEqual(got, expected, (name, path))
+            checked += 1
+            matched += expected
+        self.assertGreater(matched, 100)
+        self.assertGreater(checked - matched, 100)
+
+    def test_many_tokens_do_not_backtrack(self):
+        plugin = make_plugin()
+        long_name = "/usr/lib64/" + "a" * 60 + ".so"
+        dotted = "/usr/lib64/" + "a." * 40 + "so"
+        libraries = {long_name: 1, dotted: 2}
+        with deadline(10):
+            # Adjacent tokens, as LD_PRELOAD='/lib64/$LIB$LIB...X.so' sets them.
+            for count in (8, 14, 40):
+                name = "/lib64/" + "$LIB" * count + "X.so"
+                self.assertIsNone(plugin._lookup(name, libraries), count)
+            # Tokens between literals that also occur inside what a token spans.
+            name = "/lib64/" + ".".join(["$LIB"] * 8) + ".X"
+            self.assertIsNone(plugin._lookup(name, libraries))
+            self.assertEqual(
+                plugin._lookup("/lib64/" + "$LIB." * 7 + "$LIB.so", {dotted: 2}), (dotted, 2)
+            )
+        # More tokens than any real path has are not matched at all.
+        matcher = ldpreload.LdPreload._token_suffix_regex("/" + "$LIB" * 9)
+        self.assertFalse(matcher.search("/aaaaaaaaaaaa"))
+
+    def test_symbol_name_search_is_bounded(self):
+        # A string table without terminators is not searched to its end for
+        # every one of up to 65536 symbols.
+        data = b"\x7fELF" + b"A" * 20000 + b"\x00"
+        name = ldpreload.ElfReader._string_at(data, 4, len(data) - 4, 1)
+        self.assertLessEqual(len(name), ldpreload.ELF_NAME_MAX)
+
+    def test_name_read_length_is_capped_at_a_file_name(self):
+        length = ldpreload.LdPreload._name_read_len
+        self.assertEqual(length({b"evil.so", b"libfoo.so.1"}), 12)
+        # A 100 KiB "basename" from an environment value.
+        self.assertEqual(length({b"x" * 100000, b"evil.so"}), 256)
+
+    def test_task_list_failing_midway_ends_the_walk_with_a_warning(self):
+        def tasks(*args, **kwargs):
+            raise ldpreload.exceptions.InvalidAddressException("layer", 0xDEAD, "smeared")
+            yield  # pragma: no cover - makes this a generator
+
+        with mock.patch.object(ldpreload.pslist.PsList, "list_tasks", tasks), \
+                self.assertLogs(ldpreload.vollog, "WARNING") as logs:
+            self.assertEqual(list(ldpreload.LdPreload.get_superblocks(None, "kernel")), [])
+        # Said once, with what was being walked and the error that ended it.
+        (message,) = logs.output
+        self.assertIn("task list was aborted", message)
+        self.assertIn("smeared", message)
+        self.assertIn("incomplete", message)
+
+    def test_aborted_iteration_keeps_what_came_before_and_warns_once(self):
+        def items():
+            yield 1
+            yield 2
+            raise AttributeError("no such member")
+
+        with self.assertLogs(ldpreload.vollog, "WARNING") as logs:
+            self.assertEqual(list(ldpreload.LdPreload._safe_iter(items(), "mount list")), [1, 2])
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("mount list", logs.output[0])
+        self.assertIn("no such member", logs.output[0])
+        # A walk that simply ends says nothing.
+        with mock.patch.object(ldpreload, "vollog") as log:
+            self.assertEqual(list(ldpreload.LdPreload._safe_iter(iter([1]))), [1])
+        log.warning.assert_not_called()
+
+
+@unittest.skipUnless(HAVE_FRAMEWORK, "volatility3 is not importable")
+class ElfCompletenessTests(unittest.TestCase):
+    HOOK = [("readdir", STT_FUNC, STB_GLOBAL, True)]
+
+    def test_complete_symbol_table(self):
+        info = ldpreload.ElfReader.parse(build_elf(self.HOOK))
+        self.assertFalse(info.incomplete)
+        self.assertFalse(ldpreload.ElfReader.parse(build_elf([])).incomplete)
+
+    def test_stripped_or_missing_section_table_is_incomplete(self):
+        for label, data in (
+            ("no section headers", build_elf(self.HOOK, strip_sections=True)),
+            ("headers not cached", build_elf(self.HOOK, truncate_at=200)),
+            ("bad entry size", build_elf(self.HOOK, shentsize=0)),
+        ):
+            with self.subTest(label):
+                info = ldpreload.ElfReader.parse(data)
+                self.assertTrue(info.valid)
+                self.assertEqual(info.exported, [])
+                self.assertTrue(info.incomplete)
+
+    def test_symbols_beyond_the_parse_cap_are_incomplete(self):
+        # 65536 fillers first, the hook after them.
+        symbols = [("f", STT_FUNC, STB_LOCAL, True)] * 65536 + self.HOOK
+        info = ldpreload.ElfReader.parse(build_elf(symbols))
+        self.assertEqual(info.interposed(), [])
+        self.assertTrue(info.incomplete)
+
+    def test_uncached_symbol_or_string_page_is_incomplete(self):
+        # 400 fillers push the hook's symbol and name past the first file page;
+        # .dynstr starts at 64, .dynsym right after it.
+        symbols = [(f"filler{n:04}", STT_FUNC, STB_LOCAL, True) for n in range(400)]
+        data = build_elf(symbols + self.HOOK)
+        self.assertEqual(ldpreload.ElfReader.parse(data).interposed(), ["readdir"])
+        for label, page in (("string table", 0x1000), ("symbol table", 0x2000)):
+            with self.subTest(label):
+                holed = data[:page] + b"\x00" * 0x1000 + data[page + 0x1000 :]
+                self.assertTrue(ldpreload.ElfReader.parse(holed).incomplete)
+
+    def rows(self, elf, env_var=""):
+        path = "/usr/lib64/libquiet.so"
+        entry = ldpreload.PreloadEntry(
+            preload_path=env_var or "/etc/ld.so.preload",
+            library=path,
+            env_var=env_var,
+            env_pids={100: "bash"} if env_var else {},
+            recovered=ldpreload.RecoveredFile(path=path, inode_addr=1, data=b"\x7fELF"),
+            elf=elf,
+        )
+        plugin = make_plugin({"skip-maps": True}, _entries=[entry])
+        return [row for _, row in plugin._generator()]
+
+    def test_unknown_overrides_are_not_rendered_as_none(self):
+        na = ldpreload.renderers.NotAvailableValue
+        nap = ldpreload.renderers.NotApplicableValue
+        (row,) = self.rows(ldpreload.ElfReader.parse(build_elf(self.HOOK, strip_sections=True)))
+        self.assertIsInstance(row[4], na)
+        self.assertIn("symbol table not fully readable", row[6])
+        self.assertIn("unknown", row[6])
+        # A fully read table without a known hook still says "none".
+        helper = [("helper", STT_FUNC, STB_GLOBAL, True)]
+        (row,) = self.rows(ldpreload.ElfReader.parse(build_elf(helper)))
+        self.assertIsInstance(row[4], nap)
+        self.assertIsInstance(row[6], nap)
+
+    def test_read_note_reaches_the_library_row(self):
+        path = "/usr/lib64/libquiet.so"
+        entry = ldpreload.PreloadEntry(
+            preload_path="/etc/ld.so.preload",
+            library=path,
+            recovered=ldpreload.RecoveredFile(
+                path=path, inode_addr=1, data=b"", note=f"{path} not read: out of memory"
+            ),
+        )
+        plugin = make_plugin({"skip-maps": True}, _entries=[entry])
+        ((_, row),) = plugin._generator()
+        self.assertIn("not read: out of memory", row[6])
+
+
+@unittest.skipUnless(HAVE_FRAMEWORK, "volatility3 is not importable")
+class ReadBudgetTests(unittest.TestCase):
+    """The lenient budget of an ordinary ``read_inode`` (no ``max_size``)."""
+
+    CONTEXT = SimpleNamespace(modules={"kernel": SimpleNamespace(layer_name="layer")})
+
+    def read(self, inode, write, compat=None, **kwargs):
+        compat = compat or mock.Mock(return_value=b"")
+        with mock.patch.object(
+            ldpreload.pagecache.InodePages, "write_inode_content_to_stream", side_effect=write
+        ), mock.patch.object(ldpreload, "_read_pages_compat", compat), \
+                mock.patch.object(ldpreload, "vollog"):
+            return ldpreload.read_inode(self.CONTEXT, "kernel", inode, "/tmp/x.so", **kwargs), compat
+
+    @staticmethod
+    def framework_write(context, layer, inode, stream):
+        # What the framework's writer does with a page at the end of the file.
+        stream.truncate(inode.i_size)
+        stream.seek(inode.i_size - 4096)
+        stream.write(b"x" * 4096)
+
+    def test_sparse_file_above_the_budget_is_read_up_to_it(self):
+        # 1 TiB declared, one cached page at its very end: without a budget the
+        # buffer would be zero filled up to that page.
+        inode = fake_inode(i_size=1 << 40)
+        compat = mock.Mock(return_value=b"\x7fELF")
+        recovered, compat = self.read(inode, self.framework_write, compat, limit=1 << 16)
+        compat.assert_called_once_with(self.CONTEXT, "kernel", inode, 1 << 16, strict=False)
+        self.assertEqual(recovered.data, b"\x7fELF")
+        self.assertTrue(recovered.truncated)
+        self.assertIn(f"only the first {1 << 16} of {1 << 40} bytes", recovered.note)
+
+    def test_default_budget_applies_without_an_explicit_limit(self):
+        inode = fake_inode(i_size=ldpreload.FILE_READ_MAX_SIZE + 1)
+        recovered, compat = self.read(inode, self.framework_write)
+        self.assertEqual(compat.call_args[0][3], ldpreload.FILE_READ_MAX_SIZE)
+        self.assertTrue(recovered.truncated)
+
+    def test_file_within_the_budget_is_not_truncated(self):
+        inode = fake_inode(i_size=8192)
+        recovered, compat = self.read(inode, self.framework_write, limit=1 << 16)
+        compat.assert_not_called()
+        self.assertEqual(len(recovered.data), 8192)
+        self.assertFalse(recovered.truncated)
+        self.assertEqual(recovered.note, "")
+
+    def test_unreadable_size_is_still_bounded(self):
+        inode = fake_inode()
+        del inode.i_size
+
+        def write(context, layer, inode, stream):
+            stream.seek(1 << 40)
+
+        recovered, compat = self.read(inode, write, limit=1 << 16)
+        compat.assert_called_once_with(self.CONTEXT, "kernel", inode, 1 << 16, strict=False)
+        self.assertEqual(recovered.data, b"")
+
+    def test_out_of_memory_is_reported_not_raised(self):
+        for label, write, compat in (
+            ("framework reader", mock.Mock(side_effect=MemoryError), None),
+            (
+                "compatibility reader",
+                mock.Mock(side_effect=AttributeError("page.mapping")),
+                mock.Mock(side_effect=MemoryError),
+            ),
+        ):
+            with self.subTest(label):
+                recovered, _ = self.read(fake_inode(), write, compat)
+                self.assertEqual(recovered.data, b"")
+                self.assertIn("out of memory", recovered.note)
+
+    def test_unusable_timestamps_become_none(self):
+        # The framework hands back an absent-value object for a time it cannot
+        # convert -- the epoch itself, as `touch -d @0` sets it, included -- and
+        # raises on an inode layout it does not know. Either used to reach
+        # `ctime - mtime` and the timeliner as if it were a datetime.
+        stamp = datetime.datetime(2026, 7, 10, tzinfo=datetime.timezone.utc)
+
+        def unsupported():
+            raise ldpreload.exceptions.VolatilityException("Unsupported kernel inode type")
+
+        inode = fake_inode()
+        inode.get_modification_time = ldpreload.renderers.UnparsableValue
+        inode.get_change_time = lambda: stamp
+        recovered, _ = self.read(inode, lambda *args: None)
+        self.assertIsNone(recovered.modification_time)
+        self.assertEqual(recovered.change_time, stamp)
+        self.assertEqual(
+            ldpreload.LdPreload._timestamp_note(
+                "library", recovered.modification_time, recovered.change_time
+            ),
+            "",
+        )
+        inode.get_change_time = unsupported
+        recovered, _ = self.read(inode, lambda *args: None)
+        self.assertIsNone(recovered.change_time)
+
+    def test_callers_pass_their_budgets(self):
+        kernel = FakeKernel({1: b"/lib/evil.so\n", 2: b"\x7fELF"})
+        limits = {}
+
+        def read(context, module, inode, path, max_size=None, limit=None):
+            limits[path] = limit
+            return kernel.read(context, module, inode, path)
+
+        plugin = kernel.plugin({"no-env": True, "skip-maps": True, "no-scan": True})
+        plugin.get_cached_regular_files = lambda *args: iter(
+            [("/etc/ld.so.preload", 1), ("/lib/evil.so", 2)]
+        )
+        with mock.patch.object(ldpreload, "read_inode", side_effect=read), \
+                mock.patch.object(ldpreload, "vollog"):
+            plugin._collect()
+            plugin._collect_linker_artifacts("kernel", [("/lib/ld-2.17.so.tmp", 2)])
+        self.assertEqual(limits["/etc/ld.so.preload"], ldpreload.PRELOAD_FILE_MAX_SIZE)
+        self.assertEqual(limits["/lib/ld-2.17.so.tmp"], ldpreload.LOADER_MAX_SIZE)
+        self.assertEqual(limits["/lib/evil.so"], ldpreload.FILE_READ_MAX_SIZE)
+
+    def test_truncated_scan_candidate_is_not_a_preload_file(self):
+        kernel = FakeKernel({1: b"/lib/evil.so\n"})
+        plugin = kernel.plugin()
+        plugin._first_page_peeker = lambda *args: None
+
+        def read(context, module, inode, path, max_size=None, limit=None):
+            self.assertEqual(limit, ldpreload.PRELOAD_SCAN_MAX_SIZE)
+            return ldpreload.RecoveredFile(
+                path=path, inode_addr=1, data=b"/lib/evil.so\n", truncated=True
+            )
+
+        found = []
+        with mock.patch.object(ldpreload, "read_inode", side_effect=read), \
+                mock.patch.object(ldpreload, "vollog"):
+            plugin._scan_disguised_preloads("kernel", [("/var/big.log", 1)], found, set())
+        self.assertEqual(found, [])
+
+    def test_unreadable_size_is_noted_and_truncated_when_the_budget_is_filled(self):
+        limit = 1 << 16
+        for label, written, truncated in (
+            ("fills the budget", limit, True),
+            ("ends within the budget", 4096, False),
+        ):
+            with self.subTest(label):
+                inode = fake_inode()
+                del inode.i_size
+                recovered, _ = self.read(
+                    inode, lambda c, l, i, stream: stream.write(b"x" * written), limit=limit
+                )
+                self.assertEqual(len(recovered.data), written)
+                self.assertEqual(recovered.truncated, truncated)
+                self.assertIn("size of /tmp/x.so unreadable", recovered.note)
+        # A readable size leaves the note empty, as before.
+        recovered, _ = self.read(fake_inode(8192), self.framework_write, limit=limit)
+        self.assertEqual((recovered.truncated, recovered.note), (False, ""))
+
+    def test_scan_candidate_of_unreadable_size_is_not_a_preload_file(self):
+        # Through the real read_inode: preload content filling the scan budget
+        # of a file whose size is unknown is cut off, not complete.
+        content = b"/lib/evil.so\n".ljust(ldpreload.PRELOAD_SCAN_MAX_SIZE, b"\n")
+        self.assertTrue(ldpreload.LdPreload._looks_like_preload(content))
+        kernel = FakeKernel({1: content}, sizes={1: None})
+        plugin = kernel.plugin()
+        plugin._first_page_peeker = lambda *args: None
+        found = []
+        with mock.patch.object(
+            ldpreload.pagecache.InodePages,
+            "write_inode_content_to_stream",
+            side_effect=lambda c, l, i, stream: stream.write(content),
+        ), mock.patch.object(ldpreload, "vollog"):
+            plugin._scan_disguised_preloads("kernel", [("/var/x.log", 1)], found, set())
+        self.assertEqual(found, [])
+        self.assertEqual(plugin._read_total, 0)
+
+
+def budget_read(kernel):
+    """A ``read_inode`` stand-in that honours ``limit`` the way the real one
+    does: the content up to it, ``truncated`` and a note if the file is longer."""
+
+    def read(context, module_name, inode, path, max_size=None, limit=None):
+        kernel.reads.append(path)
+        kernel.bounds.append(limit)
+        data = kernel.files[inode.vol.offset]
+        cut = len(data) > limit
+        return ldpreload.RecoveredFile(
+            path=path,
+            inode_addr=inode.vol.offset,
+            data=data[:limit],
+            truncated=cut,
+            note=f"only the first {limit} of {len(data)} bytes of {path} were read "
+            "(read budget)" if cut else "",
+        )
+
+    return read
+
+
+@unittest.skipUnless(HAVE_FRAMEWORK, "volatility3 is not importable")
+class TotalReadBudgetTests(unittest.TestCase):
+    """All budgeted reads of one plugin run share ``TOTAL_READ_MAX_SIZE``."""
+
+    def setUp(self):
+        patch = mock.patch.object(ldpreload, "TOTAL_READ_MAX_SIZE", 10000)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_reads_stop_when_the_total_is_used_up(self):
+        kernel = FakeKernel({n: b"x" * 6000 for n in (1, 2, 3, 4)})
+        plugin = kernel.plugin()
+        inode = lambda n: kernel.object("inode", offset=n)  # noqa: E731
+        with mock.patch.object(ldpreload, "read_inode", side_effect=budget_read(kernel)), \
+                self.assertLogs(ldpreload.vollog, "WARNING") as logs:
+            first = plugin._read_file("kernel", inode(1), "/lib/a.so", limit=8192)
+            second = plugin._read_file("kernel", inode(2), "/lib/b.so", limit=8192)
+            third = plugin._read_file("kernel", inode(3), "/lib/c.so", limit=8192)
+            fourth = plugin._read_file("kernel", inode(4), "/lib/d.so")
+        # Within the total: untouched, with the caller's own limit.
+        self.assertEqual((len(first.data), first.truncated, first.note), (6000, False, ""))
+        # Only the rest of the total is read, and the note says why.
+        self.assertEqual((len(second.data), second.truncated), (4000, True))
+        self.assertIn("total read budget of 10000 bytes", second.note)
+        # Nothing left: not read at all.
+        for recovered in (third, fourth):
+            self.assertEqual((recovered.data, recovered.truncated), (b"", True))
+            self.assertIn("not read: the total read budget", recovered.note)
+        self.assertEqual(kernel.reads, ["/lib/a.so", "/lib/b.so"])
+        self.assertEqual(kernel.bounds, [8192, 4000])
+        self.assertEqual(plugin._read_total, 10000)
+        # One warning for the run, not one per file.
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("/lib/b.so", logs.output[0])
+
+    def test_the_count_belongs_to_the_plugin_instance(self):
+        kernel = FakeKernel({1: b"x" * 9000})
+        with mock.patch.object(ldpreload, "read_inode", side_effect=budget_read(kernel)), \
+                mock.patch.object(ldpreload, "vollog"):
+            for _ in range(2):
+                plugin = kernel.plugin()
+                recovered = plugin._read_file(
+                    "kernel", kernel.object("inode", offset=1), "/lib/a.so"
+                )
+                self.assertFalse(recovered.truncated)
+        self.assertFalse(hasattr(ldpreload, "_read_total"))
+        fresh = ldpreload.LdPreload.__new__(ldpreload.LdPreload)
+        with mock.patch.object(ldpreload.plugins.PluginInterface, "__init__", lambda *a, **k: None):
+            fresh.__init__()
+        self.assertEqual((fresh._read_total, fresh._read_total_warned), (0, False))
+
+    def test_discarded_scan_candidates_do_not_use_up_the_total(self):
+        files = {n: b"not a preload file\n" * 100 for n in range(1, 40)}
+        kernel = FakeKernel(files)
+        plugin = kernel.plugin()
+        plugin._first_page_peeker = lambda *args: None
+        found = []
+        with mock.patch.object(ldpreload, "read_inode", side_effect=budget_read(kernel)), \
+                mock.patch.object(ldpreload, "vollog") as log:
+            plugin._scan_disguised_preloads(
+                "kernel", [(f"/var/log/{n}", n) for n in files], found, set()
+            )
+        self.assertEqual(len(kernel.reads), len(files))
+        self.assertEqual(plugin._read_total, 0)
+        log.warning.assert_not_called()
+
+    def test_row_of_a_library_beyond_the_total_says_so(self):
+        evil = build_elf([("readdir", STT_FUNC, STB_GLOBAL, True)])
+        preload = b"/lib/a.so\n/lib/b.so\n/lib/c.so\n"
+        kernel = FakeKernel({1: preload, 2: evil, 3: evil, 4: evil})
+        plugin = kernel.plugin({"no-env": True, "skip-maps": True, "no-scan": True})
+        plugin.get_cached_regular_files = lambda *args: iter(
+            [("/etc/ld.so.preload", 1), ("/lib/a.so", 2), ("/lib/b.so", 3), ("/lib/c.so", 4)]
+        )
+        total = len(preload) + len(evil) + 100
+        with mock.patch.object(ldpreload, "TOTAL_READ_MAX_SIZE", total), \
+                mock.patch.object(ldpreload, "read_inode", side_effect=budget_read(kernel)), \
+                self.assertLogs(ldpreload.vollog, "WARNING") as logs:
+            rows = [row for _, row in plugin._generator()]
+        self.assertEqual([row[2] for row in rows], ["/lib/a.so", "/lib/b.so", "/lib/c.so"])
+        self.assertEqual(rows[0][4], "readdir")
+        self.assertNotIn("total read budget", str(rows[0][6]))
+        # Cut short: the hook is not claimed absent, and the note says why.
+        self.assertIsInstance(rows[1][4], ldpreload.renderers.NotAvailableValue)
+        self.assertIn(f"total read budget of {total} bytes", rows[1][6])
+        self.assertIn("/lib/c.so not read: the total read budget", rows[2][6])
+        self.assertEqual(len([line for line in logs.output if "total read budget" in line]), 1)
+
+
+@unittest.skipUnless(HAVE_FRAMEWORK, "volatility3 is not importable")
+class LinearSoTokenTests(unittest.TestCase):
+    """``SO_TOKEN_RE`` without the regex: same answers, linear time."""
+
+    #: The pattern the matcher replaces; quadratic when searched unanchored.
+    REFERENCE = re.compile(r"\.so(?:\.[^/\s]+)?$")
+
+    def test_matcher_agrees_with_the_regex_it_replaces(self):
+        search = ldpreload.SO_TOKEN_RE.search
+        rng = random.Random(170)
+        alphabet = (".so", ".so.", ".", "s", "o", "/", "\n", "\t", " ", "\r", "a", "1", "\x85", "\x1c")
+        texts = [
+            "", "\n", ".so", ".so\n", ".so\n\n", "a.so.", "a.so.\n", "a.so.1\n", "a.so.1 ",
+            "a.so.\t", ".so.so", "a.so.b/c.so.d", "a.so.d/x", "a.so.1\tb", "a.so\t.so.1",
+            "/" + ".so" * 1364 + "\t", "/" + ".so" * 1364 + "\r", ".so." * 1024,
+            ".so" * 1300 + "/", "x" * 4093 + ".so", "x" * 4090 + ".so.12",
+        ]
+        texts += [
+            "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 9)))
+            for _ in range(30000)
+        ]
+        for text in texts:
+            self.assertLessEqual(len(text), 4096)
+            self.assertIs(search(text), bool(self.REFERENCE.search(text)), repr(text))
+
+    def timed(self, call):
+        with deadline(20):
+            start = time.perf_counter()
+            result = call()
+            elapsed = time.perf_counter() - start
+        self.assertLess(elapsed, 1.0)
+        return result
+
+    def test_megabyte_environment_name_is_assessed_in_linear_time(self):
+        # LD_PRELOAD is not split at a tab, so the whole megabyte is one name.
+        name = ".so" * ((1 << 20) // 3) + "\t"
+        self.assertEqual(ldpreload.LdPreload._split_preload_value(name), [name])
+        entry = ldpreload.PreloadEntry(
+            preload_path="LD_PRELOAD", library=name, env_var="LD_PRELOAD", env_pids={1: "sh"}
+        )
+        (kept,) = self.timed(lambda: make_plugin()._assess_env_entries([entry]))
+        self.assertIn("not named like a shared object", kept.reasons)
+
+    def test_megabyte_token_is_tested_for_preload_content_in_linear_time(self):
+        looks = ldpreload.LdPreload._looks_like_preload
+        body = b"/" + b".so" * ((1 << 20) // 3)
+        # A carriage return is part of the token, and not of a shared-object name.
+        self.assertFalse(self.timed(lambda: looks(body + b"\r")))
+        self.assertTrue(self.timed(lambda: looks(body + b".1\n")))
+        self.assertFalse(self.timed(lambda: looks(body + b".1/x\n")))
+
+
+@unittest.skipUnless(HAVE_FRAMEWORK, "volatility3 is not importable")
+class UnreadLoaderTailTests(unittest.TestCase):
+    """A loader whose end is not cached is not called patched."""
+
+    PATH = "/usr/lib64/ld-2.17.so"
+
+    def check(self, data, size):
+        kernel = FakeKernel({7: data}, sizes={7: size})
+        with mock.patch.object(ldpreload, "read_inode", side_effect=kernel.read), \
+                mock.patch.object(ldpreload, "vollog"):
+            (check,) = kernel.plugin()._check_loaders("kernel", {self.PATH: 7}, {})
+        return check.state
+
+    def test_loader_shorter_than_its_size_is_inconclusive(self):
+        rodata = (b"\x00/etc/ld.so.cache\x00" + b"r" * 0x2000).ljust(0x3000, b"r")
+        elf = build_elf([], rodata=rodata)
+        self.assertEqual(self.check(elf, len(elf)), "patched")
+        # The recovered content ends with the last cached page: the section
+        # headers and whatever else follows were never seen.
+        cut = elf[:0x2000]
+        self.assertIsNone(ldpreload.ElfReader.section_range(cut, ".rodata"))
+        self.assertFalse(ldpreload._has_zero_page(cut))
+        self.assertEqual(self.check(cut, len(elf)), "inconclusive")
+
+    def test_patched_loader_with_complete_rodata_and_uncached_tail_is_patched(self):
+        # The in-place patch: .rodata is located by the section headers and
+        # lies wholly in the recovered content. A tail that is not cached
+        # (debug sections, say) cannot hold the string.
+        rodata = (b"\x00/etc/ld.so.cache\x00" + b"r" * 0x2000).ljust(0x3000, b"r")
+        elf = build_elf([], rodata=rodata)
+        start, size = ldpreload.ElfReader.section_range(elf, ".rodata")
+        self.assertLessEqual(start + size, len(elf))
+        self.assertEqual(self.check(elf, len(elf) + 1), "patched")
+        self.assertEqual(self.check(elf, len(elf) + (1 << 20)), "patched")
+        # A hole inside .rodata still leaves it open.
+        holed = bytearray(elf)
+        holed[0x1000:0x2000] = bytes(0x1000)
+        self.assertEqual(self.check(bytes(holed), len(elf) + 1), "inconclusive")
+
+    def test_rodata_reaching_past_the_recovered_content_is_inconclusive(self):
+        rodata = (b"\x00/etc/ld.so.cache\x00" + b"r" * 0x2000).ljust(0x3000, b"r")
+        elf = bytearray(build_elf([], rodata=rodata))
+        # Grow .rodata's sh_size (fourth section header) past the end of what
+        # was read: the string may sit in the part that is not cached.
+        shoff = struct.unpack_from("<Q", elf, 40)[0]
+        struct.pack_into("<Q", elf, shoff + 3 * 64 + 32, len(elf))
+        elf = bytes(elf)
+        start, size = ldpreload.ElfReader.section_range(elf, ".rodata")
+        self.assertGreater(start + size, len(elf))
+        self.assertFalse(ldpreload._has_zero_page(elf))
+        self.assertEqual(self.check(elf, start + size), "inconclusive")
+        self.assertEqual(self.check(elf, None), "inconclusive")
+
+    def test_loader_of_unreadable_size_is_inconclusive(self):
+        rodata = b"\x00/etc/ld.so.cache\x00".ljust(0x100, b"r")
+        bare = build_elf([], rodata=rodata, strip_sections=True)
+        self.assertEqual(self.check(bare, len(bare)), "patched")
+        self.assertEqual(self.check(bare, None), "inconclusive")
+        # With .rodata located and complete, the size does not matter.
+        self.assertEqual(self.check(build_elf([], rodata=rodata), None), "patched")
+
+    def test_intact_loader_stays_intact_whatever_was_read(self):
+        elf = build_elf([], rodata=b"\x00/etc/ld.so.preload\x00")
+        self.assertEqual(self.check(elf, len(elf) + 4096), "intact")
+
+
+@unittest.skipUnless(HAVE_FRAMEWORK, "volatility3 is not importable")
+class ForgedSymbolTableTests(unittest.TestCase):
+    """Section headers are the file author's word; no or an empty ``.dynsym``
+    is not evidence that a library exports nothing."""
+
+    HOOK = [("readdir", STT_FUNC, STB_GLOBAL, True)]
+    SHT_SYMTAB = 2
+
+    @staticmethod
+    def patched_dynsym(data, sh_type=None, sh_size=None):
+        """``data`` with the type or size of its .dynsym header (index 2) changed."""
+        image = bytearray(data)
+        header = struct.unpack_from("<Q", image, 40)[0] + 2 * 64
+        if sh_type is not None:
+            struct.pack_into("<I", image, header + 4, sh_type)
+        if sh_size is not None:
+            struct.pack_into("<Q", image, header + 32, sh_size)
+        return bytes(image)
+
+    def test_empty_dynsym_is_incomplete(self):
+        info = ldpreload.ElfReader.parse(self.patched_dynsym(build_elf(self.HOOK), sh_size=0))
+        self.assertTrue(info.valid)
+        self.assertEqual(info.exported, [])
+        self.assertTrue(info.incomplete)
+
+    def test_missing_dynsym_is_incomplete(self):
+        info = ldpreload.ElfReader.parse(
+            self.patched_dynsym(build_elf(self.HOOK), sh_type=SHT_PROGBITS)
+        )
+        self.assertEqual(info.exported, [])
+        self.assertTrue(info.incomplete)
+
+    def test_symtab_fallback_is_read_but_incomplete(self):
+        info = ldpreload.ElfReader.parse(
+            self.patched_dynsym(build_elf(self.HOOK), sh_type=self.SHT_SYMTAB)
+        )
+        self.assertEqual(info.interposed(), ["readdir"])
+        self.assertTrue(info.incomplete)
+
+    def test_library_with_empty_dynsym_is_not_assumed_safe(self):
+        path = "/usr/lib64/libquiet.so"
+        for label, data, benign in (
+            ("real table", build_elf([("helper", STT_FUNC, STB_GLOBAL, True)]), True),
+            ("empty table", self.patched_dynsym(build_elf(self.HOOK), sh_size=0), False),
+        ):
+            with self.subTest(label):
+                entry = ldpreload.PreloadEntry(
+                    preload_path="LD_PRELOAD",
+                    library=path,
+                    env_var="LD_PRELOAD",
+                    env_pids={100: "bash"},
+                    recovered=ldpreload.RecoveredFile(path=path, inode_addr=1, data=data),
+                    elf=ldpreload.ElfReader.parse(data),
+                )
+                plugin = make_plugin({"filter-safe-env": True, "skip-maps": True})
+                kept = plugin._assess_env_entries([entry])
+                self.assertEqual(entry.benign, benign)
+                self.assertEqual(kept, [] if benign else [entry])
+                if not benign:
+                    plugin._entries = kept
+                    ((_, row),) = plugin._generator()
+                    self.assertIsInstance(row[4], ldpreload.renderers.NotAvailableValue)
+                    self.assertIn("symbol table not fully readable", row[6])
+
+
+@unittest.skipUnless(HAVE_FRAMEWORK, "volatility3 is not importable")
+class ControlCharacterTests(unittest.TestCase):
+    """Names from the image are shown with their control characters escaped,
+    and kept as they are internally."""
+
+    CONTROL = re.compile("[\x00-\x1f\x7f-\x9f  ]")
+
+    def test_display_escapes(self):
+        display = ldpreload._display
+        self.assertEqual(display("/lib/a.so"), "/lib/a.so")
+        self.assertEqual(display("a\nb\tc\rd"), "a\\nb\\tc\\rd")
+        self.assertEqual(display("\x00\x1b[2J\x7f"), "\\x00\\x1b[2J\\x7f")
+        self.assertEqual(display("\x85\x9b "), "\\x85\\x9b\\u2028")
+        self.assertEqual(display("größe ünïcode $LIB"), "größe ünïcode $LIB")
+        for code in list(range(0x20)) + [0x7F]:
+            self.assertIsNone(self.CONTROL.search(display(f"a{chr(code)}b")), code)
+        # Escaping twice changes nothing more.
+        self.assertEqual(display(display("a\nb")), "a\\nb")
+
+    def test_rows_carry_no_control_characters(self):
+        library = "/tmp/evil.so\n/etc/ld.so.preload\t2026-01-01\tlibc.so.6\r\x1b[2K\x7f"
+        elf = ldpreload.ElfInfo(valid=True, bits=64, exported=["helper\nreaddir", "open\tx"])
+        recovered = ldpreload.RecoveredFile(
+            path="/tmp/dir\n/evil.so", inode_addr=1, data=b"\x7fELF", note="note\rhere"
+        )
+        entries = [
+            ldpreload.PreloadEntry(
+                preload_path="/etc/x\n/etc/ld.so.preload",
+                library=library,
+                recovered=recovered,
+                elf=elf,
+                detection="disguised preload file",
+            ),
+            ldpreload.PreloadEntry(
+                preload_path="LD_PRELOAD",
+                library="evil\n.so",
+                env_var="LD_PRELOAD",
+                env_pids={7: "ba\nsh\t"},
+                recovered=recovered,
+                elf=elf,
+                reasons=["hidden file"],
+            ),
+        ]
+        loader = ldpreload.LoaderCheck(
+            ldpreload.RecoveredFile(path="/lib\n64/ld-2.17.so", inode_addr=2, data=b""),
+            "patched",
+            reads="/etc/a\tb",
+        )
+        artifact = ldpreload.RecoveredFile(
+            path="/lib64/ld-2.17.so.tmp\n", inode_addr=3, data=b"", note="odd\x0bnote"
+        )
+        plugin = make_plugin(
+            {"skip-maps": True, "all-symbols": True},
+            _entries=entries,
+            _loader_checks=[loader],
+            _linker_artifacts=[artifact],
+        )
+        rows = [row for _, row in plugin._generator()]
+        self.assertEqual(len(rows), 4)
+        for row in rows:
+            self.assertEqual(len(row), 7)
+            for cell in row:
+                if isinstance(cell, str):
+                    self.assertIsNone(self.CONTROL.search(cell), repr(cell))
+        self.assertEqual(rows[0][0], "/etc/x\\n/etc/ld.so.preload")
+        self.assertEqual(
+            rows[0][2],
+            "/tmp/evil.so\\n/etc/ld.so.preload\\t2026-01-01\\tlibc.so.6\\r\\x1b[2K\\x7f",
+        )
+        self.assertEqual(rows[0][4], "helper\\nreaddir, open\\tx")
+        self.assertIn("note\\rhere", rows[0][6])
+        self.assertIn("7 (ba\\nsh\\t)", rows[1][6])
+        self.assertIn("resolved to /tmp/dir\\n/evil.so", rows[1][6])
+        self.assertEqual(rows[2][0], "/lib\\n64/ld-2.17.so")
+        self.assertIn("reads /etc/a\\tb", rows[2][6])
+        self.assertEqual(rows[3][0], "/lib64/ld-2.17.so.tmp\\n")
+        self.assertIn("odd\\x0bnote", rows[3][6])
+        # Only the display is escaped.
+        self.assertEqual(entries[0].library, library)
+        self.assertEqual(entries[1].env_pids, {7: "ba\nsh\t"})
+
+    def test_folded_cells_keep_only_their_own_line_breaks(self):
+        entry = ldpreload.PreloadEntry(
+            preload_path="/etc/ld.so.preload",
+            library="/lib/a.so",
+            detection="a note " * 20 + "with\na\tname",
+        )
+        plugin = make_plugin({"skip-maps": True, "wrap": 40}, _entries=[entry])
+        ((_, row),) = plugin._generator()
+        self.assertTrue(row[6].startswith("\n"))
+        self.assertIn("with\\na\\tname", row[6].replace("\n", " "))
+        self.assertNotIn("\t", row[6])
+
+    def test_timeline_descriptions_are_escaped(self):
+        stamp = datetime.datetime(2026, 7, 10, tzinfo=datetime.timezone.utc)
+        preload = ldpreload.RecoveredFile(
+            path="/etc/ld.so\n.preload", inode_addr=1, data=b"", modification_time=stamp
+        )
+        plugin = make_plugin(_entries=[], _preload_files=[preload])
+        ((description, _, _),) = plugin.generate_timeline()
+        self.assertEqual(description, "ld.so.preload file /etc/ld.so\\n.preload")
+
+    def test_log_lines_are_escaped(self):
+        with self.assertLogs(ldpreload.vollog, "INFO") as logs:
+            ldpreload.vollog.info("%s=%s in PID %d (%s)", "LD_PRELOAD", "a\n.so", 7, "ba\tsh")
+            ldpreload.vollog.warning("failed: %s", ValueError("bad\rvalue"))
+            list(ldpreload.LdPreload._safe_iter(iter(()), "list"))
+        self.assertEqual(
+            [record.getMessage() for record in logs.records],
+            ["LD_PRELOAD=a\\n.so in PID 7 (ba\\tsh)", "failed: bad\\rvalue"],
+        )
+
+    def test_environment_hits_are_logged_escaped(self):
+        task = SimpleNamespace(pid=7, comm="ba\nsh")
+        plugin = make_plugin(_context=None)
+        plugin._read_environment = lambda task: b"LD_PRELOAD=/tmp/a\n.so\x00"
+        with mock.patch.object(
+            ldpreload.pslist.PsList, "list_tasks", lambda *args: iter([task])
+        ), mock.patch.object(
+            ldpreload.utility, "array_to_string", lambda comm: comm
+        ), self.assertLogs(ldpreload.vollog, "INFO") as logs:
+            (entry,) = plugin._collect_env_preloads("kernel")
+        self.assertEqual(entry.library, "/tmp/a\n.so")
+        (record,) = logs.records
+        self.assertEqual(
+            record.getMessage(),
+            "LD_PRELOAD=/tmp/a\\n.so in the environment of PID(s) 7 (ba\\nsh)",
+        )
+
+
+@unittest.skipUnless(HAVE_FRAMEWORK, "volatility3 is not importable")
+class RequirementTests(unittest.TestCase):
+    def test_every_versioned_framework_component_in_use_is_required(self):
+        required = {
+            requirement.name: requirement
+            for requirement in ldpreload.LdPreload.get_requirements()
+            if isinstance(requirement, ldpreload.requirements.VersionRequirement)
+        }
+        self.assertEqual(
+            sorted(required), ["linuxutils", "pagecache", "pslist", "timeliner"]
+        )
+        # get_path_mnt() and path_for_file() are LinuxUtilities' interface.
+        self.assertIs(
+            required["linuxutils"]._component, ldpreload.linux_symbols.LinuxUtilities
+        )
+
+    def test_requirements_are_met_by_the_installed_framework(self):
+        for requirement in ldpreload.LdPreload.get_requirements():
+            if isinstance(requirement, ldpreload.requirements.VersionRequirement):
+                wanted = tuple(requirement._version)
+                have = tuple(requirement._component.version)
+                # Same major version, at least the wanted minor and patch.
+                self.assertEqual(have[0], wanted[0], requirement.name)
+                self.assertGreaterEqual(have[1:], wanted[1:], requirement.name)
+
+    def test_plugin_version(self):
+        self.assertEqual(ldpreload.LdPreload._version, (1, 7, 0))
 
 
 if __name__ == "__main__":
