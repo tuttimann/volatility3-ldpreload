@@ -118,7 +118,7 @@ with running processes.
 | `--no-scan` | Disable the content scan, the dynamic-linker integrity check and the tamper-artifact check; only `/etc/ld.so.preload` is used. |
 | `--no-env` | Do not read process environments for `LD_PRELOAD` / `LD_AUDIT`. |
 | `--filter-safe-env` | Hide `LD_PRELOAD` / `LD_AUDIT` libraries that are assumed safe: in a system library directory with no suspicious trait, or a well-known preload (sanitisers, allocators, fakeroot, a vendor wrapper such as the Splunk forwarder's `libdlwrapper.so`). Only a library whose symbol table was read in full qualifies. By default every process carrying the variable is reported. |
-| `--all-symbols` | List every exported function of each library, not only those that shadow a known libc/PAM/pcap function. |
+| `--all-symbols` | List every exported symbol of each library (functions, data, TLS, IFUNCs), not only those that shadow a known libc/PAM/pcap function. |
 | `--skip-maps` | Do not walk process mappings (faster; `Mapped PIDs` stays empty). |
 | `--wrap N` | Fold the long cells (function lists, PID lists, notes) into lines of at most `N` characters. By default this happens only with `-r pretty`, which prints the folded cells as narrow blocks; every other renderer gets single-line cells. A value forces folding for any renderer, `0` disables it. |
 | `--dump` | Write the preload file(s), every resolved library, every patched loader and any linker artifact to the output directory (`-o`). |
@@ -156,7 +156,7 @@ row per patched dynamic linker and per leftover loader copy. Seven columns:
 | File Modification Time | That file's `mtime`: when the preload file was written, or when the loader was patched. `N/A` for an environment row. |
 | Library | The shared object the line or variable names, exactly as written (tokens such as `$PLATFORM` are kept; a bare or relative value is resolved by basename and the note says to which file). `(dynamic linker)` / `(dynamic linker copy)` for linker rows. |
 | Library Modification Time | The recovered library's `mtime`. |
-| Overridden Functions | Global `FUNC` symbols in the library's dynamic symbol table that shadow a libc/PAM/pcap function of interest (or everything, with `--all-symbols`). `N/A` means the symbol table was read and holds none; `-` means it could not be read (the note says why), so the list is unknown. |
+| Overridden Functions | Global and weak symbol definitions in the library's dynamic symbol table, of every type the loader binds (`FUNC`, `GNU_IFUNC`, `NOTYPE`, `OBJECT`, `COMMON`, `TLS`), that shadow a libc/PAM/pcap function of interest (or everything, with `--all-symbols`). `N/A` means the symbol table was read and holds none; `-` means it could not be read (the note says why), so the list is unknown. |
 | Mapped PIDs | Processes that currently map the library; consecutive PIDs collapsed into `first-last` ranges. |
 | Notes | How the file was found, which processes carry an `LD_PRELOAD` variable and why the library is suspicious, what a patched loader reads, anything that limits the analysis, and a warning when a file's change time is well after its modification time (the `mtime` was preserved from an original or set deliberately; the change time is when the file really got its content). |
 
@@ -243,12 +243,17 @@ internally, and for resolving a library, the name is used as it is.
    `PT_DYNAMIC` segment gives `DT_SYMTAB`/`DT_STRTAB`/`DT_STRSZ`, addresses are
    mapped to file offsets through the `PT_LOAD` segments, and the symbol count comes
    from `DT_GNU_HASH` (end of the last bucket's chain) or `DT_HASH` (`nchain`). It
-   keeps global `FUNC` definitions and records whether the table was read in full.
-   The section headers' `.dynsym` is a cross-check: a different offset, symbol count
-   or set of exported functions (or no `.dynsym`) is noted and makes the read
-   incomplete. Without a readable dynamic segment the section headers are a
-   fallback that never counts as complete. An uncached page of the symbol, string or
-   hash table makes the result "unknown", not "none". Every count and walk is bounded
+   keeps global and weak definitions of every symbol type glibc binds (`FUNC`,
+   `GNU_IFUNC`, `NOTYPE`, `OBJECT`, `COMMON`, `TLS`), reads each name at
+   `DT_STRTAB + st_name` through the segments as the loader does, and records
+   whether the table was read in full. Address mapping works on whole pages, as
+   the loader maps them: a page that two segments fill with different file bytes
+   is not trusted. The section headers' `.dynsym` is a cross-check: a different
+   offset, symbol count or set of exports (or no `.dynsym`) is noted, with the
+   names quoted and cut to 64 characters, and makes the read incomplete. Without a
+   readable dynamic segment the section headers are a fallback that never counts
+   as complete. An uncached page of the dynamic, symbol, string or hash table makes
+   the result "unknown", not "none". Every count and walk is bounded
    (512 program headers, 4096 dynamic entries, 65536 symbols), so forged values cost
    nothing.
 5. **Process correlation.** Each task's VMAs are followed with raw reads
@@ -291,9 +296,10 @@ forwarder, which sets `LD_PRELOAD` for its own processes, produce no false posit
   table or program headers are not cached or are implausible is read through its
   section headers instead and reported with the overridden functions as incomplete
   or unknown (`-`, and a note); one without either is unknown. Overlapping `PT_LOAD`
-  segments that map a table to two different file offsets, several `PT_DYNAMIC`
-  segments, or `DT_HASH` and `DT_GNU_HASH` counting differently also make the read
-  incomplete. The 8-byte `DT_HASH` words of 64-bit S/390 and Alpha are handled;
+  segments that fill a page of a table with different file bytes, several
+  `PT_DYNAMIC` segments (the last is read, as glibc does), a `DT_STRSZ` past its
+  segment, a wrong `DT_SYMENT`, an export name no segment maps, or `DT_HASH` and
+  `DT_GNU_HASH` counting differently also make the read incomplete. The 8-byte `DT_HASH` words of 64-bit S/390 and Alpha are handled;
   other ABI deviations are not.
 - Every file read has a size budget, so that a sparse or smeared inode cannot make
   the plugin allocate its declared size: 1 MiB for a preload file, 32 MiB for a

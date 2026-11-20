@@ -266,7 +266,7 @@ class ElfReaderTests(unittest.TestCase):
         ("open", STT_FUNC, STB_WEAK, True),
         ("helper", STT_FUNC, STB_LOCAL, True),  # local: never interposes
         ("write", STT_FUNC, STB_GLOBAL, False),  # import, not a definition
-        ("secret_table", STT_OBJECT, STB_GLOBAL, True),  # data, not a function
+        ("secret_table", STT_OBJECT, STB_GLOBAL, True),  # data: binds like a function
         ("hide_me", STT_FUNC, STB_GLOBAL, True),
         ("fopen@@GLIBC_2.2.5", STT_FUNC, STB_GLOBAL, True),
     ]
@@ -275,14 +275,18 @@ class ElfReaderTests(unittest.TestCase):
         info = ldpreload.ElfReader.parse(build_elf(self.SYMBOLS))
         self.assertTrue(info.valid)
         self.assertEqual(info.bits, 64)
-        self.assertEqual(info.exported, ["fopen", "hide_me", "open", "readdir"])
+        self.assertEqual(
+            info.exported, ["fopen", "hide_me", "open", "readdir", "secret_table"]
+        )
         self.assertEqual(info.interposed(), ["fopen", "open", "readdir"])
 
     def test_exports_32(self):
         info = ldpreload.ElfReader.parse(build_elf(self.SYMBOLS, bits=32))
         self.assertTrue(info.valid)
         self.assertEqual(info.bits, 32)
-        self.assertEqual(info.exported, ["fopen", "hide_me", "open", "readdir"])
+        self.assertEqual(
+            info.exported, ["fopen", "hide_me", "open", "readdir", "secret_table"]
+        )
 
     def test_section_range(self):
         data = build_elf(self.SYMBOLS, rodata=b"/etc/ld.so.preload\x00/etc/ld.so.cache\x00")
@@ -334,7 +338,27 @@ class ElfReaderTests(unittest.TestCase):
         data[64:100] = b"\x00" * 36  # part of .dynstr
         info = ldpreload.ElfReader.parse(bytes(data))
         self.assertTrue(info.valid)
-        self.assertTrue(set(info.exported) <= {"fopen", "hide_me", "open", "readdir"})
+        self.assertTrue(
+            set(info.exported) <= {"fopen", "hide_me", "open", "readdir", "secret_table"}
+        )
+
+    def test_every_symbol_type_the_loader_binds_is_an_export(self):
+        # glibc binds NOTYPE, OBJECT, FUNC, COMMON, TLS and GNU_IFUNC
+        # definitions (ALLOWED_STT in dl-lookup); an IFUNC or untyped open
+        # overrides libc's open as surely as a FUNC.
+        for kind in (0, 1, 2, 5, 6, 10):
+            for bits in (32, 64):
+                with self.subTest(kind=kind, bits=bits):
+                    data = build_elf([("open", kind, STB_GLOBAL, True)], bits=bits)
+                    info = ldpreload.ElfReader.parse(data)
+                    self.assertEqual(info.interposed(), ["open"])
+                    self.assertFalse(info.incomplete)
+        # Section and file symbols are not bound; an undefined IFUNC is an import.
+        for symbol in (("open", 3, STB_GLOBAL, True), ("open", 4, STB_GLOBAL, True),
+                       ("open", 10, STB_GLOBAL, False), ("open", 10, STB_LOCAL, True)):
+            with self.subTest(symbol=symbol):
+                info = ldpreload.ElfReader.parse(build_elf([symbol]))
+                self.assertEqual(info.exported, [])
 
 
 @unittest.skipUnless(HAVE_FRAMEWORK, "volatility3 is not importable")
@@ -2077,6 +2101,13 @@ class ForgedSymbolTableTests(unittest.TestCase):
                     self.assertIn("symbol table not fully readable", row[6])
 
 
+#: Wall-clock bounds for the ELF parser: one parse, and the 600 mutated
+#: images. They only catch an endless (or quadratic) loop; a parse takes
+#: milliseconds, and shared CI runners can stall for seconds.
+PARSE_SECONDS = 10
+PARSE_ALL_SECONDS = 30
+
+
 def patch_dynamic(data, offsets, tag, value=None, new_tag=None, bits=64, endian="<"):
     """``data`` with the value (and/or tag) of its dynamic entry ``tag`` changed."""
     image = bytearray(data)
@@ -2108,13 +2139,31 @@ def patch_phdr(data, offsets, index, field, value):
     return bytes(image)
 
 
+def with_phdrs(data, offsets, extra, at=None):
+    """``data`` (64-bit LE) with its program header table moved to the end of
+    the image -- padded with ``x`` to ``at`` first, if given -- and ``extra``
+    ``(p_type, p_offset, p_vaddr, p_filesz)`` headers appended to the builder's
+    two. The moved table lies outside the PT_LOAD, which the reader (like the
+    loader) does not need."""
+    image = bytearray(data)
+    if at is not None:
+        image += b"x" * (at - len(image))
+    table = bytes(data[offsets["phdr"] : offsets["phdr"] + 2 * 56]) + b"".join(
+        struct.pack("<IIQQQQQQ", kind, 4, offset, vaddr, vaddr, filesz, filesz, 0x1000)
+        for kind, offset, vaddr, filesz in extra
+    )
+    struct.pack_into("<Q", image, 32, len(image))  # e_phoff
+    struct.pack_into("<H", image, 56, 2 + len(extra))  # e_phnum
+    return bytes(image + table)
+
+
 @unittest.skipUnless(HAVE_FRAMEWORK, "volatility3 is not importable")
 class DynamicSegmentTests(unittest.TestCase):
     """The symbol table is read through PT_DYNAMIC, as the loader reads it;
     section headers are a fallback and a cross-check."""
 
     SYMBOLS = ElfReaderTests.SYMBOLS
-    EXPORTS = ["fopen", "hide_me", "open", "readdir"]
+    EXPORTS = ["fopen", "hide_me", "open", "readdir", "secret_table"]
     HOOK = [("readdir", STT_FUNC, STB_GLOBAL, True)]
     DISAGREE = "section headers disagree with the dynamic segment"
 
@@ -2172,7 +2221,8 @@ class DynamicSegmentTests(unittest.TestCase):
                 position = rng.randrange(len(image))
                 image[position] = rng.choice((0, 0xFF, rng.randrange(256)))
             self.assertIsInstance(ldpreload.ElfReader.parse(bytes(image)), ldpreload.ElfInfo)
-        self.assertLess(time.monotonic() - started, 5)
+        # Generous: catches an endless loop, not a slow shared CI runner.
+        self.assertLess(time.monotonic() - started, PARSE_ALL_SECONDS)
 
     def test_addresses_are_mapped_through_pt_load(self):
         for style in ("sysv", "gnu"):
@@ -2240,11 +2290,47 @@ class DynamicSegmentTests(unittest.TestCase):
         data, offsets = build_elf_layout(hidden, rodata=decoy)
         forged = ForgedSymbolTableTests.patched_dynsym(data, sh_offset=offsets["rodata"])
         info = ldpreload.ElfReader.parse(forged)
-        self.assertEqual(info.exported, ["fopen", "open", "readdir"])
+        self.assertEqual(info.exported, ["fopen", "open", "readdir", "secret_table"])
         self.assertTrue(info.incomplete)
         (note,) = info.notes
         self.assertIn(self.DISAGREE, note)
-        self.assertIn("only in .dynsym: hide_me", note)
+        self.assertIn("only in .dynsym: 'hide_me'", note)
+
+    def test_names_in_the_cross_check_note_are_quoted_and_bounded(self):
+        # Forged names in the disagreement note: each cut to 64 characters
+        # and quoted, so "; " or ")" in a name reads as part of it; the whole
+        # note bounded.
+        # Only in the dynamic table (global there, local in the decoy) ...
+        mine = ["a; b) c", "b" * 300] + [f"w{n}" + "v" * 200 for n in range(4)]
+        # ... and only in the decoy .dynsym.
+        theirs = [f"z{n:02}" + "y" * 200 for n in range(10)]
+        dynamic = [(name, STT_FUNC, STB_GLOBAL, True) for name in mine] + [
+            (name, STT_FUNC, STB_LOCAL, True) for name in theirs
+        ]
+        listed = [(name, STT_FUNC, STB_LOCAL, True) for name in mine] + [
+            (name, STT_FUNC, STB_GLOBAL, True) for name in theirs
+        ]
+        source, source_at = build_elf_layout(listed)
+        decoy = source[source_at["dynsym"] : source_at["dynsym"] + (len(listed) + 1) * 24]
+        data, offsets = build_elf_layout(dynamic, rodata=decoy)
+        forged = ForgedSymbolTableTests.patched_dynsym(data, sh_offset=offsets["rodata"])
+        info = ldpreload.ElfReader.parse(forged)
+        self.assertEqual(info.source, "dynamic")
+        self.assertEqual(info.exported, sorted(mine))
+        self.assertTrue(info.incomplete)
+        (note,) = info.notes
+        self.assertTrue(note.startswith(self.DISAGREE + " ("))
+        detail = note[len(self.DISAGREE) + 2 : -1]
+        self.assertLessEqual(len(detail), ldpreload.NOTE_DISAGREEMENT_MAX)
+        self.assertTrue(detail.endswith("..."))
+        self.assertIn("only in the dynamic segment: 'a; b) c', 'bbb", note)
+        self.assertIn("'" + "b" * 61 + "...'", note)
+        self.assertNotIn("b" * 62, note)
+        self.assertIn("(+1 more)", note)
+        quote = ldpreload._quote_name
+        self.assertEqual(quote("open"), "'open'")
+        self.assertEqual(len(quote("z" * 1000)), 64 + 2)
+        self.assertEqual(quote("it's"), '"it\'s"')
 
     def test_no_pt_dynamic_falls_back_to_section_headers(self):
         data, offsets = build_elf_layout(self.SYMBOLS)
@@ -2268,16 +2354,43 @@ class DynamicSegmentTests(unittest.TestCase):
                 patch_dynamic(data, offsets, DT_HASH, new_tag=0x70000000)
             )
         )
-        # A string table size beyond the file.
-        self.assert_fallback(
-            ldpreload.ElfReader.parse(patch_dynamic(data, offsets, DT_STRSZ, 1 << 40))
-        )
+        # A string table size beyond the file. The loader does not use
+        # DT_STRSZ to read names, so a forged one must not hand the verdict to
+        # the section headers (which anyone can rewrite): the dynamic table is
+        # still read, its mapped part checked, and the read is incomplete.
+        info = ldpreload.ElfReader.parse(patch_dynamic(data, offsets, DT_STRSZ, 1 << 40))
+        self.assert_dynamic_incomplete(info)
+        self.assertIn("DT_STRSZ 0x10000000000 reaches past its segment", info.notes)
+
+    def assert_dynamic_incomplete(self, info):
+        """Read through the dynamic table, with its exports, but flagged."""
+        self.assertTrue(info.valid)
+        self.assertEqual(info.source, "dynamic")
+        self.assertEqual(info.exported, self.EXPORTS)
+        self.assertTrue(info.incomplete)
 
     def test_wrong_symbol_entry_size(self):
+        # The loader ignores DT_SYMENT; entries have the class's size.
         data, offsets = build_elf_layout(self.SYMBOLS)
         info = ldpreload.ElfReader.parse(patch_dynamic(data, offsets, DT_SYMENT, 16))
+        self.assert_dynamic_incomplete(info)
+        self.assertEqual(info.notes, ["DT_SYMENT 16 is not 24"])
+
+    def test_the_last_of_several_pt_dynamic_is_read(self):
+        # glibc keeps the last PT_DYNAMIC; the first one here points at an
+        # empty dynamic table (a lone DT_NULL) in .rodata.
+        data, offsets = build_elf_layout(self.SYMBOLS, rodata=b"\x00" * 16 + b"x" * 48)
+        dynamic = offsets["dynamic"]
+        image = with_phdrs(data, offsets, [(PT_DYNAMIC, dynamic, dynamic, 0x70)])
+        image = patch_phdr(image, {"phdr": len(data)}, 1, "vaddr", offsets["rodata"])
+        info = ldpreload.ElfReader.parse(image)
+        self.assert_dynamic_incomplete(info)
+        self.assertEqual(info.notes, ["2 PT_DYNAMIC program headers; the last is read"])
+        # The decoy last: no table, no fallback to a first-match.
+        image = with_phdrs(data, offsets, [(PT_DYNAMIC, 0, offsets["rodata"], 0x40)])
+        info = ldpreload.ElfReader.parse(image)
         self.assert_fallback(info)
-        self.assertIn("DT_SYMENT 16 is not 24", info.notes)
+        self.assertIn("2 PT_DYNAMIC program headers; the last is read", info.notes)
 
     def test_dynamic_segment_without_dt_null(self):
         data, offsets = build_elf_layout(self.SYMBOLS)
@@ -2306,7 +2419,7 @@ class DynamicSegmentTests(unittest.TestCase):
                 struct.pack_into("<I", image, offsets["hash"] + position, value)
                 started = time.monotonic()
                 self.assert_fallback(ldpreload.ElfReader.parse(bytes(image)))
-                self.assertLess(time.monotonic() - started, 1)
+                self.assertLess(time.monotonic() - started, PARSE_SECONDS)
         data, offsets = build_elf_layout(self.SYMBOLS, hash_style="gnu")
         gnu = offsets["gnu_hash"]
         bucket = gnu + 16 + 8  # header, one 64-bit bloom word
@@ -2321,7 +2434,7 @@ class DynamicSegmentTests(unittest.TestCase):
                 struct.pack_into("<I", image, position, value)
                 started = time.monotonic()
                 self.assert_fallback(ldpreload.ElfReader.parse(bytes(image)))
-                self.assertLess(time.monotonic() - started, 1)
+                self.assertLess(time.monotonic() - started, PARSE_SECONDS)
 
     def test_gnu_hash_chain_without_an_end(self):
         data, offsets = build_elf_layout(self.SYMBOLS, hash_style="gnu")
@@ -2397,7 +2510,7 @@ class DynamicSegmentTests(unittest.TestCase):
         struct.pack_into("<H", data, 56, 0xFFFF)
         started = time.monotonic()
         info = ldpreload.ElfReader.parse(bytes(data))
-        self.assertLess(time.monotonic() - started, 1)
+        self.assertLess(time.monotonic() - started, PARSE_SECONDS)
         self.assert_fallback(info)
         self.assertIn("implausible program header count 65535", info.notes)
         struct.pack_into("<H", data, 54, 0)  # e_phentsize
@@ -2439,6 +2552,175 @@ class DynamicSegmentTests(unittest.TestCase):
         self.assertFalse(amap.ambiguous)
         # The range has to lie within one segment's file part.
         self.assertIsNone(amap.offset(0xF0, 0x100))
+        self.assertFalse(amap.ambiguous)
+
+    def test_overlap_is_judged_per_page(self):
+        # The loader maps whole pages, a later segment over an earlier one:
+        # a page another segment fills with other file bytes is ambiguous
+        # even where that segment's file part does not reach.
+        P = 0x1000
+        # Partial overlap: B's file part covers half of A's second page.
+        a, b = (0, 0, 2 * P), (P + 0x800, 5 * P + 0x800, 0x800)
+        amap = ldpreload._AddressMap([a, b], 64)
+        self.assertEqual(amap.offset(0x100, 8), (0x100, 2 * P))  # page 0: A only
+        self.assertFalse(amap.ambiguous)
+        self.assertIsNone(amap.offset(P + 0x10, 8))  # A's bytes, B's page
+        self.assertTrue(amap.ambiguous)
+        amap = ldpreload._AddressMap([a, b], 64)
+        self.assertIsNone(amap.offset(P + 0x900, 8))  # inside both
+        self.assertTrue(amap.ambiguous)
+        # A range on page 0 reaching into the shared page.
+        amap = ldpreload._AddressMap([a, b], 64)
+        self.assertIsNone(amap.offset(P - 8, 16))
+        self.assertTrue(amap.ambiguous)
+        # Adjacent segments sharing a page, the range across their boundary:
+        # in neither file part alone.
+        c, d = (0, 0, P + 0x800), (P + 0x800, 3 * P + 0x800, 0x800)
+        amap = ldpreload._AddressMap([c, d], 64)
+        self.assertIsNone(amap.offset(P + 0x7F8, 16))
+        self.assertIsNone(amap.offset(P + 0x100, 8))  # c's bytes, d's page
+        self.assertTrue(amap.ambiguous)
+        # The linker's layout: segments sharing a page with the same
+        # vaddr - offset put the same bytes there; a data segment whose
+        # difference differs lives on pages of its own.
+        amap = ldpreload._AddressMap(
+            [(0, 0, 0x5F0), (0x5F0, 0x5F0, 0x1A10), (0x2E10, 0x1E10, 0x230)], 64
+        )
+        self.assertEqual(amap.offset(0x5E8, 0x10), None)  # across a boundary
+        self.assertEqual(amap.offset(0x5F0, 0x10), (0x5F0, 0x2000))
+        self.assertEqual(amap.offset(0x100, 0x10), (0x100, 0x5F0))
+        self.assertEqual(amap.offset(0x2E20, 8), (0x1E20, 0x2040))
+        self.assertFalse(amap.ambiguous)
+        # p_align is not the page size: a 2 MiB alignment does not widen pages.
+        amap = ldpreload._AddressMap([(0, 0, 0x1000), (0x201000, 0x1000, 0x100)], 64)
+        self.assertEqual(amap.offset(0xFF8, 8), (0xFF8, 0x1000))
+        self.assertFalse(amap.ambiguous)
+
+    def test_address_map_of_many_segments_stays_fast(self):
+        # Every export's name is looked up through the map: 512 forged,
+        # interleaved segments and 65536 lookups must not multiply.
+        loads = [(n * 0x1800, n * 0x1800, 0x2000 + n) for n in range(512)]
+        started = time.monotonic()
+        amap = ldpreload._AddressMap(loads, 64)
+        for n in range(65536):
+            address = (n * 0x2F3) % (512 * 0x1800)
+            self.assertEqual(amap.offset(address, 8)[0], address)
+        self.assertFalse(amap.ambiguous)
+        self.assertLess(time.monotonic() - started, PARSE_SECONDS)
+
+    def test_a_shared_page_with_other_bytes_makes_the_table_untrusted(self):
+        data, offsets = build_elf_layout(self.SYMBOLS, rodata=b"x" * 0x40)
+        self.assertLess(len(data), 0x1000)  # every table on page 0
+        rodata = offsets["rodata"]
+        # A second PT_LOAD over 16 bytes of .rodata, from elsewhere in the
+        # file: it reaches no table, but its page holds all of them.
+        image = with_phdrs(data, offsets, [(PT_LOAD, 0x2000, rodata, 0x10)])
+        info = ldpreload.ElfReader.parse(image)
+        self.assert_fallback(info)
+        self.assertIn(
+            "overlapping PT_LOAD segments map a dynamic table ambiguously", info.notes
+        )
+        # The same bytes again (same vaddr - offset): nothing to doubt.
+        image = with_phdrs(data, offsets, [(PT_LOAD, rodata, rodata, 0x10)])
+        self.assert_dynamic_complete(ldpreload.ElfReader.parse(image))
+
+    def test_names_are_read_through_the_segments(self):
+        # The loader reads a name at DT_STRTAB + st_name in memory. Here that
+        # address lies in a second PT_LOAD that maps .rodata far above the
+        # first one, beyond DT_STRSZ; the file offset .dynstr + st_name is
+        # past the end of the file.
+        base, high = 0x400000, 0x500000
+        data, offsets = build_elf_layout(
+            [("placeholder", STT_FUNC, STB_GLOBAL, True)],
+            rodata=b"readdir\x00",
+            strip_sections=True,
+            vaddr_base=base,
+        )
+        rodata = offsets["rodata"]
+        page = rodata - rodata % 0x1000
+        st_name = high + rodata - (base + offsets["dynstr"])
+        self.assertGreater(offsets["dynstr"] + st_name, len(data))
+        image = bytearray(data)
+        struct.pack_into("<I", image, offsets["dynsym"] + 24, st_name)
+        image = bytes(image)
+
+        def parse(filesz, *extra):
+            load = (PT_LOAD, page, high + page, rodata - page + filesz)
+            return ldpreload.ElfReader.parse(with_phdrs(image, offsets, [load, *extra]))
+
+        info = parse(8)
+        self.assertEqual(info.source, "dynamic")
+        self.assertEqual(info.interposed(), ["readdir"])
+        self.assertEqual(info.notes, [])
+        self.assertFalse(info.incomplete)
+        # The name runs off the segment's file part before its NUL.
+        info = parse(4)
+        self.assertEqual(info.exported, [])
+        self.assertTrue(info.incomplete)
+        # Another segment fills the name's page with other bytes.
+        info = parse(8, (PT_LOAD, 0x3000, high + page + 0x800, 0x10))
+        self.assertEqual(info.exported, [])
+        self.assertTrue(info.incomplete)
+        self.assertIn("overlapping PT_LOAD segments map a symbol name ambiguously", info.notes)
+        # Not mapped at all.
+        info = ldpreload.ElfReader.parse(with_phdrs(image, offsets, []))
+        self.assertEqual(info.exported, [])
+        self.assertTrue(info.incomplete)
+
+    def test_uncached_page_of_the_dynamic_table_is_incomplete(self):
+        # The dynamic table straddles a page boundary after DT_STRSZ; an
+        # uncached second page reads as an early DT_NULL and still leaves
+        # every tag a read needs.
+        first = build_elf_layout(self.SYMBOLS, hash_style="both")[1]["dynamic"]
+        padding = -(first + 5 * 16) % 0x1000
+        data, offsets = build_elf_layout(
+            self.SYMBOLS, hash_style="both", rodata=b"x" * padding
+        )
+        boundary = offsets["dynamic"] + 5 * 16
+        self.assertEqual(boundary % 0x1000, 0)
+        # The program headers moved past the page, so that they stay readable.
+        image = with_phdrs(data, offsets, [], at=boundary + 0x1000)
+        self.assert_dynamic_complete(ldpreload.ElfReader.parse(image))
+        holed = image[:boundary] + b"\x00" * 0x1000 + image[boundary + 0x1000 :]
+        info = ldpreload.ElfReader.parse(holed)
+        self.assertEqual(info.source, "dynamic")
+        self.assertEqual(info.exported, self.EXPORTS)
+        self.assertTrue(info.incomplete)
+
+    AMBIGUOUS = "overlapping PT_LOAD segments map a dynamic table ambiguously"
+
+    def test_later_page_of_a_table_under_another_segment_is_ambiguous(self):
+        # Only a table's first bytes decide where it is; a later page that
+        # another segment fills with other bytes (a decoy entry, bucket or
+        # chain the loader would see) makes the table untrusted.
+        first = build_elf_layout(self.SYMBOLS, hash_style="both")[1]["dynamic"]
+        padding = -(first + 5 * 16) % 0x1000
+        data, offsets = build_elf_layout(
+            self.SYMBOLS, hash_style="both", rodata=b"x" * padding
+        )
+        boundary = offsets["dynamic"] + 5 * 16
+        image = with_phdrs(
+            data, offsets, [(PT_LOAD, 0x100, boundary + 0x100, 0x10)], at=boundary + 0x1000
+        )
+        info = ldpreload.ElfReader.parse(image)
+        self.assert_fallback(info)
+        self.assertIn(self.AMBIGUOUS, info.notes)
+        # Hash tables over several pages, the other segment over one inside.
+        symbols = [(f"filler{n:04}", STT_FUNC, STB_LOCAL, True) for n in range(3000)]
+        for style in ("sysv", "gnu"):
+            with self.subTest(style):
+                data, offsets = build_elf_layout(symbols + self.HOOK, hash_style=style)
+                start = offsets["hash" if style == "sysv" else "gnu_hash"]
+                page = start + -start % 0x1000
+                self.assertLessEqual(page + 0x1000, offsets["dynamic"])
+                self.assert_dynamic_complete(
+                    ldpreload.ElfReader.parse(with_phdrs(data, offsets, [])),
+                    exported=["readdir"],
+                )
+                image = with_phdrs(data, offsets, [(PT_LOAD, 0x100, page + 0x100, 0x10)])
+                info = ldpreload.ElfReader.parse(image)
+                self.assert_fallback(info)
+                self.assertIn(self.AMBIGUOUS, info.notes)
 
     def test_uncached_symbol_string_or_hash_page_is_incomplete(self):
         symbols = [(f"filler{n:04}", STT_FUNC, STB_LOCAL, True) for n in range(1500)]
@@ -2513,6 +2795,11 @@ class DynamicSegmentTests(unittest.TestCase):
                 continue
             seen += 1
             with self.subTest(path.name):
+                dynsym = ldpreload.ElfReader.section_range(data, ".dynsym")
+                entry = 24 if data[4] == 2 else 16
+                if dynsym and dynsym[1] // entry > ldpreload.ELF_SYMBOL_MAX:
+                    # More symbols than are parsed: rightly incomplete.
+                    self.skipTest(f"{path.name}: more than ELF_SYMBOL_MAX symbols")
                 info = ldpreload.ElfReader.parse(data)
                 self.assertEqual(info.source, "dynamic")
                 self.assertEqual(info.notes, [])

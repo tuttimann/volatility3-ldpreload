@@ -118,6 +118,7 @@ rest of the task's mappings.
 Plugin provided: ``linux.ldpreload.LdPreload``.
 """
 
+import bisect
 import datetime
 import fnmatch
 import functools
@@ -587,8 +588,22 @@ DT_GNU_HASH = 0x6FFFFEF5
 ELF_HASH64_MACHINES = (22, 0x9026)
 
 STT_FUNC = 2
+STT_GNU_IFUNC = 10
+#: Symbol types whose definitions the loader binds references to (glibc's
+#: ALLOWED_STT in dl-lookup): NOTYPE, OBJECT, FUNC, COMMON, TLS and GNU_IFUNC.
+#: Any of them overrides a libc symbol of the same name.
+ELF_BOUND_TYPES = frozenset((0, 1, STT_FUNC, 5, 6, STT_GNU_IFUNC))
 STB_LOCAL = 0
 SHN_UNDEF = 0
+
+#: The granularity the loader maps segments at. Segments are mmap'd as whole
+#: pages (MAP_FIXED, a later one over an earlier one); p_align is the linker's
+#: maximum page size and says nothing about which file bytes end up in a page.
+ELF_PAGE_SIZE = 4096
+
+#: Longest symbol name quoted in a note, and longest cross-check note.
+NOTE_NAME_MAX = 64
+NOTE_DISAGREEMENT_MAX = 512
 
 # What a forged header can make the reader walk. A real object has about ten
 # program headers, a few dozen dynamic entries and hash tables sized to its
@@ -626,14 +641,18 @@ class ElfInfo:
 
     valid: bool = False
     bits: int = 0
-    #: Global FUNC symbols the object *defines*: these override libc at load time.
+    #: Global and weak symbols the object *defines*, of every type the loader
+    #: binds (functions, GNU indirect functions, data, TLS, COMMON and untyped):
+    #: these override libc at load time.
     exported: List[str] = field(default_factory=list)
     #: The symbol table could not be read to its end through the dynamic
     #: segment -- the way the loader finds it: no readable ``PT_DYNAMIC`` or
     #: hash table (forged, or its page not cached; only the section headers
     #: were left to go by), a page of the tables not cached, more symbols than
-    #: are parsed, or section headers that disagree with it. ``exported`` is
-    #: then not the whole truth and an empty list proves nothing.
+    #: are parsed, an export name not mapped by a segment, forged values the
+    #: loader ignores (DT_STRSZ, DT_SYMENT, several ``PT_DYNAMIC``), or section
+    #: headers that disagree with it. ``exported`` is then not the whole truth
+    #: and an empty list proves nothing.
     incomplete: bool = False
     #: Where ``exported`` comes from: "dynamic" (``PT_DYNAMIC``), "sections"
     #: (the ``.dynsym`` / ``.symtab`` section-header fallback) or "".
@@ -643,7 +662,7 @@ class ElfInfo:
     notes: List[str] = field(default_factory=list)
 
     def interposed(self) -> List[str]:
-        """Exported functions that shadow a libc function of interest."""
+        """Exported symbols that shadow a libc function of interest."""
         return [name for name in self.exported if name in INTERPOSED_LIBC_FUNCTIONS]
 
 
@@ -665,11 +684,26 @@ class _SymbolTable:
     #: ``total`` is exact; False for a GNU hash table that hashes no symbol
     #: (its symoffset is only a lower bound) without a DT_HASH to settle it.
     exact: bool = True
+    #: For a table read through the dynamic segment: the address mapping and
+    #: the address of DT_STRTAB. Names are then read at ``str_address +
+    #: st_name`` through the mapping, as the loader reads them; without a
+    #: mapping (section headers) at file offset ``str_offset + st_name``.
+    amap: Optional["_AddressMap"] = None
+    str_address: int = 0
 
 
 class _AddressMap:
     """Virtual address -> file offset through the ``PT_LOAD`` segments' file
-    parts, the way the loader maps the object."""
+    parts, the way the loader maps the object.
+
+    The loader maps whole pages, a later segment over an earlier one, so an
+    address is only resolved if no other segment's file part reaches into any
+    page the queried range touches with a different ``vaddr - offset`` (which
+    would put other file bytes there). Segments sharing a page with the same
+    difference -- the normal linker layout -- map the same bytes and are fine.
+
+    Lookups cost O(log n) after an O(n^2) setup over at most ``ELF_PHDR_MAX``
+    segments, so a symbol name can be resolved per export."""
 
     def __init__(self, loads: List[Tuple[int, int, int]], bits: int) -> None:
         limit = 1 << bits
@@ -680,29 +714,85 @@ class _AddressMap:
             for vaddr, offset, filesz in loads
             if vaddr + filesz <= limit and offset + filesz <= limit
         ]
-        #: Some address mapped to more than one file offset.
+        #: Some address range touched a page that two segments fill with
+        #: different file bytes.
         self.ambiguous = False
+
+        # Exact containment: the elementary intervals between all segment
+        # bounds, each with the segments covering it sorted by their end.
+        spans = [(vaddr + filesz, vaddr, offset) for vaddr, offset, filesz in self._loads]
+        self._bounds = sorted({low for _, low, _ in spans} | {end for end, _, _ in spans})
+        self._covering: List[List[Tuple[int, int, int]]] = []
+        self._ends: List[List[int]] = []
+        for low, high in zip(self._bounds, self._bounds[1:]):
+            covering = sorted(span for span in spans if span[1] <= low and high <= span[0])
+            self._covering.append(covering)
+            self._ends.append([span[0] for span in covering])
+
+        # Page coverage: the elementary intervals between the page-rounded
+        # bounds of the segments' file parts, each with the differences
+        # (vaddr - offset) of the segments whose pages cover it.
+        page = ELF_PAGE_SIZE
+        pages = [
+            (vaddr - vaddr % page, end + -end % page, vaddr - offset)
+            for end, vaddr, offset in spans
+            if end > vaddr
+        ]
+        self._page_bounds = sorted({low for low, _, _ in pages} | {high for _, high, _ in pages})
+        self._page_deltas: List[Set[int]] = [
+            {delta for start, stop, delta in pages if start <= low and high <= stop}
+            for low, high in zip(self._page_bounds, self._page_bounds[1:])
+        ]
+
+    def _containing(self, address: int, end: int) -> Optional[Tuple[int, int, int]]:
+        """``(end, vaddr, offset)`` of the segment with the nearest end whose
+        file part holds ``[address, end)``."""
+        index = bisect.bisect_right(self._bounds, address) - 1
+        if 0 <= index < len(self._covering):
+            ends = self._ends[index]
+            found = bisect.bisect_left(ends, end)
+            if found < len(ends):
+                return self._covering[index][found]
+        if end == address:
+            # An empty range at the very end of a segment (or in an empty
+            # one) lies in no elementary interval.
+            spans = [
+                (vaddr + filesz, vaddr, offset)
+                for vaddr, offset, filesz in self._loads
+                if vaddr <= address <= vaddr + filesz
+            ]
+            return min(spans) if spans else None
+        return None
 
     def offset(self, address: int, size: int) -> Optional[Tuple[int, int]]:
         """``(file offset of address, file offset where its segment's file
         part ends)`` if ``[address, address + size)`` lies within one segment's
-        file part and every segment holding it agrees on the offset; else None."""
+        file part and no page it touches holds other file bytes; else None
+        (and ``ambiguous`` is set in the latter case)."""
         if size < 0:
             return None
-        hits = {
-            (offset + address - vaddr, offset + filesz)
-            for vaddr, offset, filesz in self._loads
-            if vaddr <= address and address + size <= vaddr + filesz
-        }
-        if len({start for start, _ in hits}) > 1:
-            # Overlapping segments with different contents: the loader maps
-            # the later one over the earlier, a first-match parser would read
-            # a decoy. Neither is trusted.
-            self.ambiguous = True
+        end = address + size
+        span = self._containing(address, end)
+        if span is None:
             return None
-        if not hits:
-            return None
-        return min(hits, key=lambda hit: hit[1])
+        segment_end, vaddr, offset = span
+        delta = vaddr - offset
+        page = ELF_PAGE_SIZE
+        first = address - address % page
+        last = max(end, address + 1)
+        last += -last % page
+        index = max(bisect.bisect_right(self._page_bounds, first) - 1, 0)
+        while index < len(self._page_deltas) and self._page_bounds[index] < last:
+            if self._page_bounds[index + 1] > first and (
+                self._page_deltas[index] - {delta}
+            ):
+                # Another segment puts different file bytes in a page of the
+                # range: the loader maps the later one over the earlier, a
+                # first-match parser would read a decoy. Neither is trusted.
+                self.ambiguous = True
+                return None
+            index += 1
+        return address - delta, segment_end - delta
 
 
 class ElfReader:
@@ -772,6 +862,10 @@ class ElfReader:
         info.exported, read_all = cls._walk_symbols(data, endian, info.bits, dynamic)
         info.source = "dynamic"
         complete = dynamic.complete and read_all and dynamic.count > 0
+        if dynamic.amap is not None and dynamic.amap.ambiguous:
+            # A name on a page two segments fill differently was not read.
+            info.notes.append("overlapping PT_LOAD segments map a symbol name ambiguously")
+            complete = False
         # The cross-check needs section headers that were actually recovered;
         # a header table past the end of the recovered content or on an
         # uncached page says nothing, and is not a disagreement.
@@ -852,20 +946,23 @@ class ElfReader:
         dynamics = [header for header in headers if header[0] == PT_DYNAMIC]
         if not dynamics:
             return None
-        if len(dynamics) > 1:
-            notes.append(f"{len(dynamics)} PT_DYNAMIC program headers")
-            return None
         amap = _AddressMap(
             [(vaddr, offset, filesz) for kind, offset, vaddr, filesz in headers if kind == PT_LOAD],
             bits,
         )
+        # glibc's _dl_map_object_from_fd keeps the last PT_DYNAMIC it sees;
+        # so does the reader. Several are still forged.
         try:
-            table = cls._read_dynamic(data, endian, bits, machine, dynamics[0][2], amap, notes)
+            table = cls._read_dynamic(data, endian, bits, machine, dynamics[-1][2], amap, notes)
         except struct.error:
             table = None
         if amap.ambiguous:
             notes.append("overlapping PT_LOAD segments map a dynamic table ambiguously")
             return None
+        if len(dynamics) > 1:
+            notes.append(f"{len(dynamics)} PT_DYNAMIC program headers; the last is read")
+            if table is not None:
+                table.complete = False
         return table
 
     @classmethod
@@ -903,27 +1000,56 @@ class ElfReader:
         if not terminated:
             notes.append("dynamic segment has no DT_NULL terminator")
             return None
+        # Only the first entry was checked against the other segments; a page
+        # further on that another segment fills could hide a decoy entry.
+        if amap.offset(dynamic_vaddr, base + entry - start) is None:
+            return None
+        # A page of the dynamic table that was not cached reads as zeros: an
+        # early DT_NULL that hides the entries after it.
+        ranges: List[Tuple[int, int]] = [(start, base + entry)]
 
+        complete = True
         sym_size = 24 if bits == 64 else 16
         if DT_SYMTAB not in tags or DT_STRTAB not in tags or DT_STRSZ not in tags:
             return None
         if tags.get(DT_SYMENT, sym_size) != sym_size:
+            # The loader does not use DT_SYMENT; its entries have the size of
+            # the ELF class whatever the tag says.
             notes.append(f"DT_SYMENT {tags[DT_SYMENT]} is not {sym_size}")
-            return None
-        strings = amap.offset(tags[DT_STRTAB], tags[DT_STRSZ])
+            complete = False
+        strings = amap.offset(tags[DT_STRTAB], 1)
         if strings is None:
             return None
-        str_offset, str_size = strings[0], tags[DT_STRSZ]
+        str_offset, str_segment_end = strings
+        str_size = tags[DT_STRSZ]
+        if amap.offset(tags[DT_STRTAB], str_size) is None:
+            if amap.ambiguous:
+                return None
+            # The loader does not use DT_STRSZ to read names; the part that
+            # is mapped is checked for uncached pages, and names are mapped
+            # one by one.
+            notes.append(f"DT_STRSZ {str_size:#x} reaches past its segment")
+            complete = False
+            str_size = str_segment_end - str_offset
+            if amap.offset(tags[DT_STRTAB], str_size) is None:
+                return None
 
-        ranges: List[Tuple[int, int]] = []
         gnu = sysv = None
         if DT_GNU_HASH in tags:
             gnu = cls._gnu_hash_count(data, endian, bits, amap, tags[DT_GNU_HASH])
         if DT_HASH in tags:
             word = 8 if bits == 64 and machine in ELF_HASH64_MACHINES else 4
             sysv = cls._sysv_hash_count(data, endian, word, amap, tags[DT_HASH])
+        # Their headers were checked against the other segments; the buckets
+        # and chains read after them are checked here, page by page.
+        for tag, found, hash_range in (
+            (DT_GNU_HASH, gnu, gnu[2] if gnu else None),
+            (DT_HASH, sysv, sysv[1] if sysv else None),
+        ):
+            if found is not None and amap.offset(tags[tag], hash_range[1] - hash_range[0]) is None:
+                return None
 
-        complete, exact = True, True
+        exact = True
         sysv_count = 0
         if sysv is not None:
             nchain, sysv_range, sysv_count = sysv
@@ -976,7 +1102,8 @@ class ElfReader:
         ranges.append((sym_offset, sym_offset + count * sym_size))
         ranges.append((str_offset, str_offset + str_size))
         # A page of any of these tables that was not cached reads as zeros:
-        # null symbols, empty names, empty hash chains.
+        # an early end of the dynamic table, null symbols, empty names, empty
+        # hash chains.
         if any(_has_zero_page(data, low, high) for low, high in ranges):
             complete = False
         return _SymbolTable(
@@ -985,12 +1112,14 @@ class ElfReader:
             total=total,
             entry_size=sym_size,
             str_offset=str_offset,
-            # The loader reads a name up to its NUL whatever DT_STRSZ says, so
-            # names are read that way too; DT_STRSZ only bounds the range
-            # checked for uncached pages.
-            str_size=max(len(data) - str_offset, 0),
+            # Only bounds the range checked for uncached pages: the loader
+            # reads a name at DT_STRTAB + st_name up to its NUL whatever
+            # DT_STRSZ says, and so does _walk_symbols, through ``amap``.
+            str_size=str_size,
             complete=complete,
             exact=exact,
+            amap=amap,
+            str_address=tags[DT_STRTAB],
         )
 
     @staticmethod
@@ -1211,9 +1340,9 @@ class ElfReader:
     def _walk_symbols(
         cls, data: bytes, endian: str, bits: int, table: _SymbolTable
     ) -> Tuple[List[str], bool]:
-        """The global FUNC symbols ``table`` defines (exports), and whether all
-        ``table.count`` entries were in ``data`` and every export's name could
-        be read."""
+        """The global and weak symbols ``table`` defines (exports) of the types
+        the loader binds, and whether all ``table.count`` entries were in
+        ``data`` and every export's name could be read."""
         exported: Set[str] = set()
         named = True
         entry_size = table.entry_size
@@ -1237,11 +1366,16 @@ class ElfReader:
             if st_shndx == SHN_UNDEF:
                 # An undefined entry is an import, not a definition.
                 continue
-            # Only global/weak FUNC definitions participate in symbol interposition;
-            # local symbols never shadow libc.
-            if (st_info & 0xF) != STT_FUNC or (st_info >> 4) == STB_LOCAL:
+            # Global and weak definitions of every type the loader binds
+            # interpose -- an IFUNC resolver or an untyped symbol named open
+            # wins over libc's open as surely as a FUNC; local symbols never
+            # shadow libc.
+            if (st_info & 0xF) not in ELF_BOUND_TYPES or (st_info >> 4) == STB_LOCAL:
                 continue
-            name = cls._string_at(data, table.str_offset, table.str_size, st_name)
+            if table.amap is None:
+                name = cls._string_at(data, table.str_offset, table.str_size, st_name)
+            else:
+                name = cls._mapped_string(data, table.amap, table.str_address + st_name)
             if name:
                 # Strip the GLIBC_2.x version suffix so names compare cleanly.
                 exported.add(name.split("@", 1)[0])
@@ -1250,6 +1384,30 @@ class ElfReader:
                 # exists, but what it overrides is unknown.
                 named = False
         return sorted(exported), named
+
+    @staticmethod
+    def _mapped_string(data: bytes, amap: _AddressMap, address: int) -> str:
+        """The NUL-terminated name at virtual ``address``, read where the
+        loader finds it: through the ``PT_LOAD`` mapping, wholly within one
+        segment's file part and on pages no other segment fills differently.
+        "" if it is not there (or not recovered); a name longer than
+        ``ELF_NAME_MAX`` is cut there."""
+        found = amap.offset(address, 1)
+        if found is None:
+            return ""
+        start, segment_end = found
+        stop = min(len(data), segment_end, start + ELF_NAME_MAX)
+        end = data.find(b"\x00", start, stop)
+        length = end - start + 1  # with its NUL
+        if end < 0:
+            if stop < start + ELF_NAME_MAX:
+                # Runs off the segment's file part or the recovered content.
+                return ""
+            end, length = stop, stop - start
+        if amap.offset(address, length) is None:
+            # The rest of the name lies on a page another segment fills.
+            return ""
+        return data[start:end].decode("utf-8", "replace")
 
     @classmethod
     def _disagreement(
@@ -1274,7 +1432,7 @@ class ElfReader:
         if listed != set(exported):
 
             def some(names: Set[str]) -> str:
-                shown = sorted(names)[:5]
+                shown = [_quote_name(name) for name in sorted(names)[:5]]
                 more = len(names) - len(shown)
                 return ", ".join(shown) + (f" (+{more} more)" if more > 0 else "")
 
@@ -1285,8 +1443,20 @@ class ElfReader:
                 detail.append(f"only in the dynamic segment: {some(only_dynamic)}")
             if only_sections:
                 detail.append(f"only in .dynsym: {some(only_sections)}")
-            parts.append("other exported functions, " + "; ".join(detail))
-        return "; ".join(parts)
+            parts.append("other exported symbols, " + "; ".join(detail))
+        text = "; ".join(parts)
+        if len(text) > NOTE_DISAGREEMENT_MAX:
+            text = text[: NOTE_DISAGREEMENT_MAX - 3] + "..."
+        return text
+
+
+def _quote_name(name: str) -> str:
+    """A symbol name for a note: cut to ``NOTE_NAME_MAX`` characters and
+    quoted like ``repr``, so that a "; " or ")" in a forged name cannot pass
+    for the end of the note or the start of another one."""
+    if len(name) > NOTE_NAME_MAX:
+        name = name[: NOTE_NAME_MAX - 3] + "..."
+    return repr(name)
 
 
 # -- page cache access -----------------------------------------------------------
@@ -1948,7 +2118,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             ),
             requirements.BooleanRequirement(
                 name="all-symbols",
-                description="List every exported function, not just those that shadow "
+                description="List every exported symbol, not just those that shadow "
                 "a known libc function",
                 default=False,
                 optional=True,
