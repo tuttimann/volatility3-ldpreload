@@ -38,13 +38,21 @@ plugin's `_version` tuple.
   the cached paths of the same basename, from an index built once per run; the first
   match, and so the result, is the same. Names with `$LIB`/`$PLATFORM` tokens still
   go through the full matcher.
-- Tests: 24 new tests. The ELF ones build 32- and 64-bit, little- and big-endian images with
+- Fixed (review of this release): `nchain` of `DT_HASH` was taken as the symbol
+  count, but the loader follows buckets and chains without checking them against
+  it; an `nchain` of 1 made a library read as complete and exporting nothing.
+  Every symbol index the table names is now read, and one beyond `nchain` is noted
+  and makes the read incomplete. Names are read up to their NUL as the loader reads
+  them, not cut at `DT_STRSZ` (which could hide every export), and an export whose
+  name is not in the recovered content makes the read incomplete.
+- Tests: 28 new tests. The ELF ones build 32- and 64-bit, little- and big-endian images with
   `DT_HASH`, `DT_GNU_HASH` or both and cover forged section headers, the fallback,
   and forged dynamic data (pointers outside the file, no `DT_NULL`, huge counts,
   endless GNU chains, `e_phnum` 65535, wrapping segments, unmappable and ambiguous
   addresses, uncached pages in each table); one parses the shared objects of the
   Python running the tests (its `lib-dynload` modules, libc, the loader) and expects
-  each to be read completely and consistently. Another checks the indexed library
+  each to be read completely and consistently, and one feeds 600 randomly mutated
+  images to the parser, which must never raise. Another checks the indexed library
   lookup against the linear one on random input. The test image builder now emits
   program headers and a dynamic segment; the existing tests that are about images
   with section headers only build them without (`dynamic=False`).

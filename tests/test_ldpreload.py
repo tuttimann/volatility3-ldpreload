@@ -96,6 +96,8 @@ def build_elf_layout(
     hash_style="sysv",
     endian="<",
     vaddr_base=0,
+    machine=None,
+    hash_word=4,
 ):
     """A shared-object image with .dynstr, .dynsym, .rodata and .shstrtab and,
     with ``dynamic``, the hash table(s) of ``hash_style`` ("sysv", "gnu" or
@@ -139,8 +141,9 @@ def build_elf_layout(
     nsyms = len(symbols) + 1
     # Hash tables with real, non-zero chains: a run of zero words would read
     # as an uncached page.
-    sysv_hash = struct.pack(endian + "III", 1, nsyms, nsyms - 1) + struct.pack(
-        f"{endian}{nsyms}I", 0, *range(nsyms - 1)
+    word = "Q" if hash_word == 8 else "I"
+    sysv_hash = struct.pack(endian + word * 3, 1, nsyms, nsyms - 1) + struct.pack(
+        f"{endian}{nsyms}{word}", 0, *range(nsyms - 1)
     )
     hashed = nsyms - 1  # every symbol but the null one, from symoffset 1
     chain = [(2 * index + 2) & ~1 for index in range(hashed)]
@@ -236,7 +239,8 @@ def build_elf_layout(
         ) + struct.pack(phdr_format, *dyn)
 
     big = endian == ">"
-    machine = (43 if bits == 64 else 2) if big else (62 if bits == 64 else 3)
+    if machine is None:
+        machine = (43 if bits == 64 else 2) if big else (62 if bits == 64 else 3)
     ident = b"\x7fELF" + bytes([2 if bits == 64 else 1, 2 if big else 1, 1, 0]) + b"\x00" * 8
     phentsize = phdr_size if dynamic else 0
     if bits == 64:
@@ -2139,6 +2143,37 @@ class DynamicSegmentTests(unittest.TestCase):
                         self.assertEqual(info.bits, bits)
                         self.assert_dynamic_complete(info)
 
+    def test_eight_byte_hash_words_of_s390_and_alpha(self):
+        for machine in (22, 0x9026):
+            with self.subTest(machine=machine):
+                data = build_elf(
+                    self.SYMBOLS, endian=">", machine=machine, hash_word=8
+                )
+                self.assert_dynamic_complete(ldpreload.ElfReader.parse(data))
+        # The same table on another machine is read as 4-byte words: nbucket
+        # 0 and nchain 1, which the section headers contradict.
+        data = build_elf(self.SYMBOLS, endian=">", hash_word=8)
+        self.assertTrue(ldpreload.ElfReader.parse(data).incomplete)
+
+    def test_mutated_images_never_raise(self):
+        # Random byte changes to every kind of image the builder makes; the
+        # parser returns what it read, whatever the bytes.
+        rng = random.Random(18)
+        images = [
+            build_elf(self.SYMBOLS, bits=bits, endian=endian, hash_style=style)
+            for bits in (32, 64)
+            for endian in ("<", ">")
+            for style in ("sysv", "gnu", "both")
+        ]
+        started = time.monotonic()
+        for _ in range(600):
+            image = bytearray(rng.choice(images))
+            for _ in range(rng.randint(1, 8)):
+                position = rng.randrange(len(image))
+                image[position] = rng.choice((0, 0xFF, rng.randrange(256)))
+            self.assertIsInstance(ldpreload.ElfReader.parse(bytes(image)), ldpreload.ElfInfo)
+        self.assertLess(time.monotonic() - started, 5)
+
     def test_addresses_are_mapped_through_pt_load(self):
         for style in ("sysv", "gnu"):
             with self.subTest(style):
@@ -2311,6 +2346,30 @@ class DynamicSegmentTests(unittest.TestCase):
             )
         )
 
+    def test_nchain_smaller_than_the_chains_reach(self):
+        # The loader follows buckets and chains without checking them against
+        # nchain; an nchain of 1 would otherwise read as "defines nothing".
+        data, offsets = build_elf_layout(self.SYMBOLS, strip_sections=True)
+        image = bytearray(data)
+        struct.pack_into("<I", image, offsets["hash"] + 4, 1)
+        info = ldpreload.ElfReader.parse(bytes(image))
+        self.assertTrue(info.incomplete)
+        # What the chains reach is read all the same.
+        self.assertEqual(info.exported, self.EXPORTS)
+        self.assertIn("DT_HASH chains reach past nchain 1", " ".join(info.notes))
+
+    def test_string_table_size_does_not_hide_names(self):
+        # The loader reads names without regard to DT_STRSZ; a size of 1 must
+        # not turn every export into an empty name that is skipped.
+        data, offsets = build_elf_layout(self.SYMBOLS, strip_sections=True)
+        info = ldpreload.ElfReader.parse(patch_dynamic(data, offsets, DT_STRSZ, 1))
+        self.assertEqual(info.exported, self.EXPORTS)
+        # A name that cannot be read at all leaves the read incomplete.
+        image = bytearray(data)
+        struct.pack_into("<I", image, offsets["dynsym"] + 24, 0xFFFFFF)  # readdir's st_name
+        info = ldpreload.ElfReader.parse(bytes(image))
+        self.assertTrue(info.incomplete)
+
     def test_hash_tables_disagreeing(self):
         data, offsets = build_elf_layout(self.SYMBOLS, hash_style="both")
         image = bytearray(data)
@@ -2433,26 +2492,35 @@ class DynamicSegmentTests(unittest.TestCase):
         # without a disagreement with its section headers.
         import sysconfig
 
-        objects = set()
+        modules = set()
         directory = pathlib.Path(sysconfig.get_config_var("DESTSHARED") or "")
         if directory.is_dir():
-            objects.update(sorted(directory.glob("*.so"))[:100])
+            modules.update(sorted(directory.glob("*.so"))[:100])
+        mapped = set()
         maps = pathlib.Path("/proc/self/maps")
         if maps.exists():
             for line in maps.read_text().splitlines():
                 name = line.split(maxsplit=5)[5:]
                 if name and ".so" in name[0] and name[0].startswith("/"):
-                    objects.add(pathlib.Path(name[0]))
-        objects = sorted(path for path in objects if path.is_file())
-        if not objects:
-            self.skipTest("no shared objects found")
-        for path in objects:
+                    mapped.add(pathlib.Path(name[0]))
+        seen = 0
+        for path in sorted(modules | mapped):
+            try:
+                data = path.read_bytes()
+            except OSError:
+                continue
+            if not data.startswith(b"\x7fELF"):
+                continue
+            seen += 1
             with self.subTest(path.name):
-                info = ldpreload.ElfReader.parse(path.read_bytes())
+                info = ldpreload.ElfReader.parse(data)
                 self.assertEqual(info.source, "dynamic")
                 self.assertEqual(info.notes, [])
                 self.assertFalse(info.incomplete)
-                self.assertTrue(info.exported)
+                if path in modules:
+                    self.assertTrue(info.exported)  # PyInit_<module>
+        if not seen:
+            self.skipTest("no shared objects found")
 
 
 @unittest.skipUnless(HAVE_FRAMEWORK, "volatility3 is not importable")

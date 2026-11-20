@@ -30,8 +30,10 @@ jobs:
   minimum-framework:
     # The oldest framework the plugin accepts (_required_framework_version
     # 2.26.0), so that a call into an API added later fails here. Python 3.12:
-    # a release the framework supported when 2.26.0 came out, with a
-    # setup-python build on ubuntu-latest (the 3.12 job above runs there).
+    # inside the framework's declared requires-python (>=3.8), established
+    # well before 2.26.0, and it has a setup-python build on ubuntu-latest
+    # (the 3.12 job above runs there). 3.9 would need the older runner; the
+    # newer Pythons are covered by the matrix with the current framework.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

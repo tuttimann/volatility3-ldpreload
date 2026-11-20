@@ -924,35 +924,45 @@ class ElfReader:
             sysv = cls._sysv_hash_count(data, endian, word, amap, tags[DT_HASH])
 
         complete, exact = True, True
+        sysv_count = 0
+        if sysv is not None:
+            nchain, sysv_range, sysv_count = sysv
+            ranges.append(sysv_range)
+            if sysv_count > nchain:
+                # What the chains reach is read, but the table is forged.
+                notes.append(
+                    f"DT_HASH chains reach past nchain {nchain} "
+                    f"(to symbol {sysv_count - 1})"
+                )
+                complete = False
         if gnu is not None:
             total, exact, hash_range = gnu
             ranges.append(hash_range)
             if sysv is not None:
-                ranges.append(sysv[1])
                 if not exact:
                     # A GNU table hashing no symbol only bounds the count from
                     # below; DT_HASH counts every symbol.
-                    if sysv[0] < total:
+                    if sysv_count < total:
                         notes.append(
-                            f"DT_HASH counts {sysv[0]} symbols, fewer than the "
+                            f"DT_HASH counts {sysv_count} symbols, fewer than the "
                             f"{total} DT_GNU_HASH skips"
                         )
                         complete = False
-                    total, exact = max(total, sysv[0]), True
-                elif sysv[0] != total:
+                    total, exact = max(total, sysv_count), True
+                elif sysv_count != total:
                     notes.append(
                         f"DT_HASH and DT_GNU_HASH disagree on the symbol count "
-                        f"({sysv[0]} vs {total})"
+                        f"({sysv_count} vs {total})"
                     )
-                    total, complete = max(total, sysv[0]), False
+                    total, complete = max(total, sysv_count), False
             elif DT_HASH in tags:
                 complete = False
         elif sysv is not None:
-            total, hash_range = sysv
-            ranges.append(hash_range)
+            total = sysv_count
             # The loader would use a DT_GNU_HASH that is present; one that
             # cannot be read leaves the count unconfirmed.
-            complete = DT_GNU_HASH not in tags
+            if DT_GNU_HASH in tags:
+                complete = False
         else:
             return None
 
@@ -975,7 +985,10 @@ class ElfReader:
             total=total,
             entry_size=sym_size,
             str_offset=str_offset,
-            str_size=str_size,
+            # The loader reads a name up to its NUL whatever DT_STRSZ says, so
+            # names are read that way too; DT_STRSZ only bounds the range
+            # checked for uncached pages.
+            str_size=max(len(data) - str_offset, 0),
             complete=complete,
             exact=exact,
         )
@@ -983,22 +996,32 @@ class ElfReader:
     @staticmethod
     def _sysv_hash_count(
         data: bytes, endian: str, word: int, amap: _AddressMap, address: int
-    ) -> Optional[Tuple[int, Tuple[int, int]]]:
-        """``(nchain, table range)`` of a DT_HASH table wholly in ``data``.
-        nchain is the number of symbols in the dynamic symbol table."""
+    ) -> Optional[Tuple[int, Tuple[int, int], int]]:
+        """``(nchain, table range, reach)`` of a DT_HASH table wholly in
+        ``data``. nchain is the number of symbols in the dynamic symbol table;
+        ``reach`` is one past the highest symbol index a bucket or chain entry
+        names. The loader follows those without checking them against nchain,
+        so a reach beyond nchain means a forged nchain."""
         found = amap.offset(address, 2 * word)
         if found is None:
             return None
         start, segment_end = found
-        fmt = endian + ("QQ" if word == 8 else "II")
-        nbucket, nchain = struct.unpack_from(fmt, data, start)
+        kind = "Q" if word == 8 else "I"
+        nbucket, nchain = struct.unpack_from(endian + kind * 2, data, start)
         if nbucket > ELF_HASH_BUCKETS_MAX:
             return None
         end = start + word * (2 + nbucket + nchain)
         if end > min(segment_end, len(data)):
             # Not all of it is in the file image (a huge nchain, or a cut).
             return None
-        return nchain, (start, end)
+        reach = nchain
+        if nchain <= ELF_SYMBOL_MAX and nbucket + nchain:
+            # Beyond the cap the read is incomplete anyway.
+            entries = struct.unpack_from(
+                f"{endian}{nbucket + nchain}{kind}", data, start + 2 * word
+            )
+            reach = max(nchain, max(entries) + 1)
+        return nchain, (start, end), reach
 
     @staticmethod
     def _gnu_hash_count(
@@ -1189,8 +1212,10 @@ class ElfReader:
         cls, data: bytes, endian: str, bits: int, table: _SymbolTable
     ) -> Tuple[List[str], bool]:
         """The global FUNC symbols ``table`` defines (exports), and whether all
-        ``table.count`` entries were in ``data``."""
+        ``table.count`` entries were in ``data`` and every export's name could
+        be read."""
         exported: Set[str] = set()
+        named = True
         entry_size = table.entry_size
         if entry_size <= 0:
             return [], False
@@ -1220,7 +1245,11 @@ class ElfReader:
             if name:
                 # Strip the GLIBC_2.x version suffix so names compare cleanly.
                 exported.add(name.split("@", 1)[0])
-        return sorted(exported), True
+            else:
+                # An export whose name is outside the recovered content: it
+                # exists, but what it overrides is unknown.
+                named = False
+        return sorted(exported), named
 
     @classmethod
     def _disagreement(
@@ -3788,7 +3817,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                             else "no readable dynamic segment or section headers"
                             if not elf.source
                             else "dynamic segment not fully cached, beyond the "
-                            "read budget or contradicted"
+                            "read budget, contradicted or more symbols than are read"
                         )
                         + "); the overridden functions are "
                         + ("incomplete" if functions else "unknown")
