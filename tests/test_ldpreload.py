@@ -75,17 +75,45 @@ STB_LOCAL, STB_GLOBAL, STB_WEAK = 0, 1, 2
 SHT_PROGBITS, SHT_STRTAB, SHT_DYNSYM = 1, 3, 11
 
 
-def build_elf(
-    symbols, bits=64, rodata=b"", shentsize=None, truncate_at=None, strip_sections=False
-):
-    """A shared-object image with .dynstr, .dynsym, .rodata and .shstrtab.
+PT_LOAD, PT_DYNAMIC = 1, 2
+DT_NULL, DT_HASH, DT_STRTAB, DT_SYMTAB, DT_STRSZ, DT_SYMENT = 0, 4, 5, 6, 10, 11
+DT_GNU_HASH = 0x6FFFFEF5
 
-    ``symbols`` is a list of ``(name, type, binding, defined)``.
+
+def build_elf(*args, **kwargs):
+    """The image of ``build_elf_layout``."""
+    return build_elf_layout(*args, **kwargs)[0]
+
+
+def build_elf_layout(
+    symbols,
+    bits=64,
+    rodata=b"",
+    shentsize=None,
+    truncate_at=None,
+    strip_sections=False,
+    dynamic=True,
+    hash_style="sysv",
+    endian="<",
+    vaddr_base=0,
+    machine=None,
+    hash_word=4,
+):
+    """A shared-object image with .dynstr, .dynsym, .rodata and .shstrtab and,
+    with ``dynamic``, the hash table(s) of ``hash_style`` ("sysv", "gnu" or
+    "both"), a dynamic segment and the program headers (one PT_LOAD of the
+    whole file at ``vaddr_base``, one PT_DYNAMIC) the loader goes by. The new
+    parts follow the old ones, so the offsets of .dynstr and .dynsym do not
+    depend on them.
+
+    ``symbols`` is a list of ``(name, type, binding, defined)``. Returns the
+    image and a dict of the file offsets of its parts.
     """
-    endian = "<"
     sym_size = 24 if bits == 64 else 16
     shdr_size = 64 if bits == 64 else 40
     ehdr_size = 64 if bits == 64 else 52
+    phdr_size = 56 if bits == 64 else 32
+    dyn_size = 16 if bits == 64 else 8
 
     dynstr = bytearray(b"\x00")  # bytearrays: one test builds 65537 symbols
     name_offsets = []
@@ -110,17 +138,63 @@ def build_elf(
         ".shstrtab": 25,
     }
 
-    body = b""
+    nsyms = len(symbols) + 1
+    # Hash tables with real, non-zero chains: a run of zero words would read
+    # as an uncached page.
+    word = "Q" if hash_word == 8 else "I"
+    sysv_hash = struct.pack(endian + word * 3, 1, nsyms, nsyms - 1) + struct.pack(
+        f"{endian}{nsyms}{word}", 0, *range(nsyms - 1)
+    )
+    hashed = nsyms - 1  # every symbol but the null one, from symoffset 1
+    chain = [(2 * index + 2) & ~1 for index in range(hashed)]
+    if chain:
+        chain[-1] |= 1
+    gnu_hash = (
+        struct.pack(endian + "IIII", 1, 1, 1, 6)
+        + struct.pack(endian + ("Q" if bits == 64 else "I"), (1 << bits) - 1)
+        + struct.pack(endian + "I", 1 if hashed else 0)
+        + struct.pack(f"{endian}{hashed}I", *chain)
+    )
+
+    body = bytearray()
     offsets = {}
-    for label, blob in (
+    parts = [
         ("dynstr", dynstr),
         ("dynsym", dynsym),
         ("rodata", rodata),
         ("shstrtab", shstrtab),
-    ):
+    ]
+    if dynamic and hash_style in ("sysv", "both"):
+        parts.append(("hash", sysv_hash))
+    if dynamic and hash_style in ("gnu", "both"):
+        parts.append(("gnu_hash", gnu_hash))
+    for label, blob in parts:
         offsets[label] = ehdr_size + len(body)
         body += blob
         body += b"\x00" * (-len(body) % 8)
+
+    phoff = phnum = 0
+    if dynamic:
+        # d_ptr entries are addresses, d_val entries are not.
+        tags = []
+        if "hash" in offsets:
+            tags.append((DT_HASH, vaddr_base + offsets["hash"]))
+        if "gnu_hash" in offsets:
+            tags.append((DT_GNU_HASH, vaddr_base + offsets["gnu_hash"]))
+        tags += [
+            (DT_STRTAB, vaddr_base + offsets["dynstr"]),
+            (DT_SYMTAB, vaddr_base + offsets["dynsym"]),
+            (DT_STRSZ, len(dynstr)),
+            (DT_SYMENT, sym_size),
+            (DT_NULL, 0),
+        ]
+        dyn_format = endian + ("qQ" if bits == 64 else "iI")
+        blob = b"".join(struct.pack(dyn_format, tag, value) for tag, value in tags)
+        offsets["dynamic"] = ehdr_size + len(body)
+        body += blob
+        phoff = offsets["phdr"] = ehdr_size + len(body)
+        phnum = 2
+        body += b"\x00" * (phnum * phdr_size)
     shoff = ehdr_size + len(body)
 
     def shdr(name, sh_type, offset, size, link=0, entsize=0):
@@ -145,20 +219,44 @@ def build_elf(
         # What sstrip leaves: no section header table at all. The loader does
         # not need one (it works from PT_DYNAMIC), so the object still loads.
         headers, shoff, shnum = b"", 0, 0
+    offsets["shoff"] = shoff
 
-    ident = b"\x7fELF" + bytes([2 if bits == 64 else 1, 1, 1, 0]) + b"\x00" * 8
+    if dynamic:
+        size = ehdr_size + len(body) + len(headers)
+        if bits == 64:
+            phdr_format = endian + "IIQQQQQQ"
+            load = (PT_LOAD, 5, 0, vaddr_base, vaddr_base, size, size, 0x1000)
+            dyn = (PT_DYNAMIC, 6, offsets["dynamic"], vaddr_base + offsets["dynamic"],
+                   vaddr_base + offsets["dynamic"], len(blob), len(blob), 8)
+        else:
+            phdr_format = endian + "IIIIIIII"
+            load = (PT_LOAD, 0, vaddr_base, vaddr_base, size, size, 5, 0x1000)
+            dyn = (PT_DYNAMIC, offsets["dynamic"], vaddr_base + offsets["dynamic"],
+                   vaddr_base + offsets["dynamic"], len(blob), len(blob), 6, 4)
+        start = phoff - ehdr_size
+        body[start : start + 2 * phdr_size] = struct.pack(
+            phdr_format, *load
+        ) + struct.pack(phdr_format, *dyn)
+
+    big = endian == ">"
+    if machine is None:
+        machine = (43 if bits == 64 else 2) if big else (62 if bits == 64 else 3)
+    ident = b"\x7fELF" + bytes([2 if bits == 64 else 1, 2 if big else 1, 1, 0]) + b"\x00" * 8
+    phentsize = phdr_size if dynamic else 0
     if bits == 64:
         ehdr = ident + struct.pack(
-            endian + "HHIQQQIHHHHHH", 3, 62, 1, 0, 0, shoff, 0, 64, 0, 0, shentsize, shnum, 4
+            endian + "HHIQQQIHHHHHH",
+            3, machine, 1, 0, phoff, shoff, 0, 64, phentsize, phnum, shentsize, shnum, 4,
         )
     else:
         ehdr = ident + struct.pack(
-            endian + "HHIIIIIHHHHHH", 3, 3, 1, 0, 0, shoff, 0, 52, 0, 0, shentsize, shnum, 4
+            endian + "HHIIIIIHHHHHH",
+            3, machine, 1, 0, phoff, shoff, 0, 52, phentsize, phnum, shentsize, shnum, 4,
         )
-    data = ehdr + body + headers
+    data = ehdr + bytes(body) + headers
     if truncate_at is not None:
         data = data[:truncate_at]
-    return data
+    return data, offsets
 
 
 @unittest.skipUnless(HAVE_FRAMEWORK, "volatility3 is not importable")
@@ -168,7 +266,7 @@ class ElfReaderTests(unittest.TestCase):
         ("open", STT_FUNC, STB_WEAK, True),
         ("helper", STT_FUNC, STB_LOCAL, True),  # local: never interposes
         ("write", STT_FUNC, STB_GLOBAL, False),  # import, not a definition
-        ("secret_table", STT_OBJECT, STB_GLOBAL, True),  # data, not a function
+        ("secret_table", STT_OBJECT, STB_GLOBAL, True),  # data: binds like a function
         ("hide_me", STT_FUNC, STB_GLOBAL, True),
         ("fopen@@GLIBC_2.2.5", STT_FUNC, STB_GLOBAL, True),
     ]
@@ -177,14 +275,18 @@ class ElfReaderTests(unittest.TestCase):
         info = ldpreload.ElfReader.parse(build_elf(self.SYMBOLS))
         self.assertTrue(info.valid)
         self.assertEqual(info.bits, 64)
-        self.assertEqual(info.exported, ["fopen", "hide_me", "open", "readdir"])
+        self.assertEqual(
+            info.exported, ["fopen", "hide_me", "open", "readdir", "secret_table"]
+        )
         self.assertEqual(info.interposed(), ["fopen", "open", "readdir"])
 
     def test_exports_32(self):
         info = ldpreload.ElfReader.parse(build_elf(self.SYMBOLS, bits=32))
         self.assertTrue(info.valid)
         self.assertEqual(info.bits, 32)
-        self.assertEqual(info.exported, ["fopen", "hide_me", "open", "readdir"])
+        self.assertEqual(
+            info.exported, ["fopen", "hide_me", "open", "readdir", "secret_table"]
+        )
 
     def test_section_range(self):
         data = build_elf(self.SYMBOLS, rodata=b"/etc/ld.so.preload\x00/etc/ld.so.cache\x00")
@@ -207,7 +309,8 @@ class ElfReaderTests(unittest.TestCase):
         self.assertIsNone(ldpreload.ElfReader.section_range(b"x" * 100, ".rodata"))
 
     def test_zero_shentsize_does_not_alias_headers(self):
-        data = build_elf(self.SYMBOLS, shentsize=0)
+        # Without a dynamic segment the section headers are all there is.
+        data = build_elf(self.SYMBOLS, shentsize=0, dynamic=False)
         info = ldpreload.ElfReader.parse(data)
         self.assertTrue(info.valid)
         self.assertEqual(info.exported, [])
@@ -235,7 +338,27 @@ class ElfReaderTests(unittest.TestCase):
         data[64:100] = b"\x00" * 36  # part of .dynstr
         info = ldpreload.ElfReader.parse(bytes(data))
         self.assertTrue(info.valid)
-        self.assertTrue(set(info.exported) <= {"fopen", "hide_me", "open", "readdir"})
+        self.assertTrue(
+            set(info.exported) <= {"fopen", "hide_me", "open", "readdir", "secret_table"}
+        )
+
+    def test_every_symbol_type_the_loader_binds_is_an_export(self):
+        # glibc binds NOTYPE, OBJECT, FUNC, COMMON, TLS and GNU_IFUNC
+        # definitions (ALLOWED_STT in dl-lookup); an IFUNC or untyped open
+        # overrides libc's open as surely as a FUNC.
+        for kind in (0, 1, 2, 5, 6, 10):
+            for bits in (32, 64):
+                with self.subTest(kind=kind, bits=bits):
+                    data = build_elf([("open", kind, STB_GLOBAL, True)], bits=bits)
+                    info = ldpreload.ElfReader.parse(data)
+                    self.assertEqual(info.interposed(), ["open"])
+                    self.assertFalse(info.incomplete)
+        # Section and file symbols are not bound; an undefined IFUNC is an import.
+        for symbol in (("open", 3, STB_GLOBAL, True), ("open", 4, STB_GLOBAL, True),
+                       ("open", 10, STB_GLOBAL, False), ("open", 10, STB_LOCAL, True)):
+            with self.subTest(symbol=symbol):
+                info = ldpreload.ElfReader.parse(build_elf([symbol]))
+                self.assertEqual(info.exported, [])
 
 
 @unittest.skipUnless(HAVE_FRAMEWORK, "volatility3 is not importable")
@@ -366,6 +489,63 @@ class ResolutionTests(unittest.TestCase):
         self.assertIsNone(lookup("libmissing.so", self.LIBRARIES))
         self.assertIsNone(lookup("/nonexistent/lib.so", self.LIBRARIES))
 
+    def linear_lookup(self, name, libraries):
+        """The 1.7.0 lookup: every name against every cached path."""
+        plugin = self.plugin
+        candidates = [name]
+        expanded = plugin._expand_tokens(name)
+        if expanded != name:
+            candidates.append(expanded)
+        for candidate in candidates:
+            if candidate in libraries:
+                return candidate, libraries[candidate]
+            for path, inode_addr in libraries.items():
+                if path.endswith(candidate) and candidate.startswith("/"):
+                    return path, inode_addr
+        if ldpreload.DYNAMIC_TOKEN_RE.search(name):
+            regex = plugin._token_suffix_regex(name)
+            for path, inode_addr in libraries.items():
+                if regex.search(path):
+                    return path, inode_addr
+        if not name.startswith("/"):
+            basename = name.rsplit("/", 1)[-1]
+            matches = [
+                (path, inode_addr)
+                for path, inode_addr in libraries.items()
+                if path.rsplit("/", 1)[-1] == basename
+            ]
+            if matches:
+                matches.sort(key=lambda m: (not m[0].startswith(ldpreload.SYSTEM_LIB_DIRS), m[0]))
+                return matches[0]
+        return None
+
+    def test_indexed_lookup_matches_the_linear_one(self):
+        rng = random.Random(1800)
+        parts = ["usr", "lib", "lib64", "tmp", "x", "mnt", "root", "", "bin", "a.so", "b.so"]
+        names = ["libc.so.6", "evil.so", "a.so", "b.so", "x86_64", "lib64", ""]
+
+        def path():
+            return "/" + "/".join(rng.choice(parts) for _ in range(rng.randint(0, 4))) + (
+                "/" + rng.choice(names) if rng.random() < 0.9 else "/"
+            )
+
+        for _ in range(300):
+            libraries = {}
+            for _ in range(rng.randint(0, 30)):
+                libraries.setdefault(path(), rng.randint(1, 1000))
+            index = self.plugin._basename_index(libraries)
+            queries = list(libraries)[:5] + [path() for _ in range(10)] + [
+                rng.choice(names),
+                "./build/" + rng.choice(names),
+                "/usr/$LIB/" + rng.choice(names),
+                "/" + rng.choice(names),
+                "lib/" + rng.choice(names),
+            ]
+            for name in queries:
+                expected = self.linear_lookup(name, libraries)
+                self.assertEqual(self.plugin._lookup(name, libraries, index), expected, name)
+                self.assertEqual(self.plugin._lookup(name, libraries), expected, name)
+
     def test_suffix_match_needs_a_component_boundary(self):
         # "/lib/evil.so" must not resolve to "/evillib/evil.so"-like paths.
         self.assertIsNone(self.plugin._lookup("/mp/evil.so", {"/var/tmp/evil.so": 7}))
@@ -449,10 +629,13 @@ class EnvironmentAssessmentTests(unittest.TestCase):
         entry = self.entry(path)
         (kept,) = self.assess(entry, **{"filter-safe-env": True})
         self.assertFalse(kept.benign)
-        # ... or recovered without a readable symbol table (stripped section
-        # headers, or their page not cached). Neither is hidden as safe.
+        # ... or recovered without a readable symbol table (no dynamic segment
+        # and no section headers, or their pages not cached). Neither is
+        # hidden as safe.
         entry = self.entry(path, path)
-        entry.elf = ldpreload.ElfReader.parse(build_elf([], strip_sections=True))
+        entry.elf = ldpreload.ElfReader.parse(
+            build_elf([], strip_sections=True, dynamic=False)
+        )
         self.assertTrue(entry.elf.valid and entry.elf.incomplete)
         (kept,) = self.assess(entry, **{"filter-safe-env": True})
         self.assertFalse(kept.benign)
@@ -1361,10 +1544,12 @@ class ElfCompletenessTests(unittest.TestCase):
         self.assertFalse(ldpreload.ElfReader.parse(build_elf([])).incomplete)
 
     def test_stripped_or_missing_section_table_is_incomplete(self):
+        # Without a dynamic segment (or with its headers past the recovered
+        # content) the section headers are all there is.
         for label, data in (
-            ("no section headers", build_elf(self.HOOK, strip_sections=True)),
+            ("no section headers", build_elf(self.HOOK, strip_sections=True, dynamic=False)),
             ("headers not cached", build_elf(self.HOOK, truncate_at=200)),
-            ("bad entry size", build_elf(self.HOOK, shentsize=0)),
+            ("bad entry size", build_elf(self.HOOK, shentsize=0, dynamic=False)),
         ):
             with self.subTest(label):
                 info = ldpreload.ElfReader.parse(data)
@@ -1406,7 +1591,9 @@ class ElfCompletenessTests(unittest.TestCase):
     def test_unknown_overrides_are_not_rendered_as_none(self):
         na = ldpreload.renderers.NotAvailableValue
         nap = ldpreload.renderers.NotApplicableValue
-        (row,) = self.rows(ldpreload.ElfReader.parse(build_elf(self.HOOK, strip_sections=True)))
+        (row,) = self.rows(
+            ldpreload.ElfReader.parse(build_elf(self.HOOK, strip_sections=True, dynamic=False))
+        )
         self.assertIsInstance(row[4], na)
         self.assertIn("symbol table not fully readable", row[6])
         self.assertIn("unknown", row[6])
@@ -1833,47 +2020,66 @@ class UnreadLoaderTailTests(unittest.TestCase):
 @unittest.skipUnless(HAVE_FRAMEWORK, "volatility3 is not importable")
 class ForgedSymbolTableTests(unittest.TestCase):
     """Section headers are the file author's word; no or an empty ``.dynsym``
-    is not evidence that a library exports nothing."""
+    is not evidence that a library exports nothing. These images have no
+    dynamic segment, so the section headers are all the reader has (the
+    section-header fallback); see ``DynamicSegmentTests`` for the same forgeries
+    next to a dynamic segment."""
 
     HOOK = [("readdir", STT_FUNC, STB_GLOBAL, True)]
     SHT_SYMTAB = 2
 
     @staticmethod
-    def patched_dynsym(data, sh_type=None, sh_size=None):
-        """``data`` with the type or size of its .dynsym header (index 2) changed."""
+    def patched_dynsym(data, sh_type=None, sh_size=None, sh_offset=None):
+        """``data`` with the type, size or offset of its .dynsym header (index 2)
+        changed (64-bit little-endian images)."""
         image = bytearray(data)
         header = struct.unpack_from("<Q", image, 40)[0] + 2 * 64
         if sh_type is not None:
             struct.pack_into("<I", image, header + 4, sh_type)
+        if sh_offset is not None:
+            struct.pack_into("<Q", image, header + 24, sh_offset)
         if sh_size is not None:
             struct.pack_into("<Q", image, header + 32, sh_size)
         return bytes(image)
 
     def test_empty_dynsym_is_incomplete(self):
-        info = ldpreload.ElfReader.parse(self.patched_dynsym(build_elf(self.HOOK), sh_size=0))
+        info = ldpreload.ElfReader.parse(
+            self.patched_dynsym(build_elf(self.HOOK, dynamic=False), sh_size=0)
+        )
         self.assertTrue(info.valid)
         self.assertEqual(info.exported, [])
         self.assertTrue(info.incomplete)
 
     def test_missing_dynsym_is_incomplete(self):
         info = ldpreload.ElfReader.parse(
-            self.patched_dynsym(build_elf(self.HOOK), sh_type=SHT_PROGBITS)
+            self.patched_dynsym(build_elf(self.HOOK, dynamic=False), sh_type=SHT_PROGBITS)
         )
         self.assertEqual(info.exported, [])
         self.assertTrue(info.incomplete)
 
     def test_symtab_fallback_is_read_but_incomplete(self):
         info = ldpreload.ElfReader.parse(
-            self.patched_dynsym(build_elf(self.HOOK), sh_type=self.SHT_SYMTAB)
+            self.patched_dynsym(build_elf(self.HOOK, dynamic=False), sh_type=self.SHT_SYMTAB)
         )
         self.assertEqual(info.interposed(), ["readdir"])
+        self.assertEqual(info.source, "sections")
+        self.assertTrue(info.incomplete)
+
+    def test_section_headers_alone_are_never_complete(self):
+        info = ldpreload.ElfReader.parse(build_elf(self.HOOK, dynamic=False))
+        self.assertEqual(info.interposed(), ["readdir"])
+        self.assertEqual(info.source, "sections")
         self.assertTrue(info.incomplete)
 
     def test_library_with_empty_dynsym_is_not_assumed_safe(self):
         path = "/usr/lib64/libquiet.so"
         for label, data, benign in (
             ("real table", build_elf([("helper", STT_FUNC, STB_GLOBAL, True)]), True),
-            ("empty table", self.patched_dynsym(build_elf(self.HOOK), sh_size=0), False),
+            (
+                "empty table",
+                self.patched_dynsym(build_elf(self.HOOK, dynamic=False), sh_size=0),
+                False,
+            ),
         ):
             with self.subTest(label):
                 entry = ldpreload.PreloadEntry(
@@ -1893,6 +2099,715 @@ class ForgedSymbolTableTests(unittest.TestCase):
                     ((_, row),) = plugin._generator()
                     self.assertIsInstance(row[4], ldpreload.renderers.NotAvailableValue)
                     self.assertIn("symbol table not fully readable", row[6])
+
+
+#: Wall-clock bounds for the ELF parser: one parse, and the 600 mutated
+#: images. They only catch an endless (or quadratic) loop; a parse takes
+#: milliseconds, and shared CI runners can stall for seconds.
+PARSE_SECONDS = 10
+PARSE_ALL_SECONDS = 30
+
+
+def patch_dynamic(data, offsets, tag, value=None, new_tag=None, bits=64, endian="<"):
+    """``data`` with the value (and/or tag) of its dynamic entry ``tag`` changed."""
+    image = bytearray(data)
+    size = 16 if bits == 64 else 8
+    fmt = endian + ("qQ" if bits == 64 else "iI")
+    base = offsets["dynamic"]
+    while True:
+        entry_tag, entry_value = struct.unpack_from(fmt, image, base)
+        if entry_tag == tag:
+            struct.pack_into(
+                fmt,
+                image,
+                base,
+                entry_tag if new_tag is None else new_tag,
+                entry_value if value is None else value,
+            )
+            return bytes(image)
+        if entry_tag == DT_NULL:
+            raise KeyError(tag)
+        base += size
+
+
+def patch_phdr(data, offsets, index, field, value):
+    """``data`` with one field of program header ``index`` changed (64-bit LE)."""
+    image = bytearray(data)
+    position = {"type": 0, "offset": 8, "vaddr": 16, "filesz": 32, "memsz": 40}[field]
+    fmt = "<I" if field == "type" else "<Q"
+    struct.pack_into(fmt, image, offsets["phdr"] + index * 56 + position, value)
+    return bytes(image)
+
+
+def with_phdrs(data, offsets, extra, at=None):
+    """``data`` (64-bit LE) with its program header table moved to the end of
+    the image -- padded with ``x`` to ``at`` first, if given -- and ``extra``
+    ``(p_type, p_offset, p_vaddr, p_filesz)`` headers appended to the builder's
+    two. The moved table lies outside the PT_LOAD, which the reader (like the
+    loader) does not need."""
+    image = bytearray(data)
+    if at is not None:
+        image += b"x" * (at - len(image))
+    table = bytes(data[offsets["phdr"] : offsets["phdr"] + 2 * 56]) + b"".join(
+        struct.pack("<IIQQQQQQ", kind, 4, offset, vaddr, vaddr, filesz, filesz, 0x1000)
+        for kind, offset, vaddr, filesz in extra
+    )
+    struct.pack_into("<Q", image, 32, len(image))  # e_phoff
+    struct.pack_into("<H", image, 56, 2 + len(extra))  # e_phnum
+    return bytes(image + table)
+
+
+@unittest.skipUnless(HAVE_FRAMEWORK, "volatility3 is not importable")
+class DynamicSegmentTests(unittest.TestCase):
+    """The symbol table is read through PT_DYNAMIC, as the loader reads it;
+    section headers are a fallback and a cross-check."""
+
+    SYMBOLS = ElfReaderTests.SYMBOLS
+    EXPORTS = ["fopen", "hide_me", "open", "readdir", "secret_table"]
+    HOOK = [("readdir", STT_FUNC, STB_GLOBAL, True)]
+    DISAGREE = "section headers disagree with the dynamic segment"
+
+    def assert_dynamic_complete(self, info, exported=None):
+        self.assertTrue(info.valid)
+        self.assertEqual(info.source, "dynamic")
+        self.assertEqual(info.exported, self.EXPORTS if exported is None else exported)
+        self.assertEqual(info.notes, [])
+        self.assertFalse(info.incomplete)
+
+    def assert_fallback(self, info):
+        """No usable dynamic table: the section headers' word, incomplete."""
+        self.assertTrue(info.valid)
+        self.assertEqual(info.source, "sections")
+        self.assertTrue(info.incomplete)
+
+    def test_each_hash_style_class_and_byte_order(self):
+        for bits in (32, 64):
+            for endian in ("<", ">"):
+                for style in ("sysv", "gnu", "both"):
+                    with self.subTest(bits=bits, endian=endian, style=style):
+                        data = build_elf(
+                            self.SYMBOLS, bits=bits, endian=endian, hash_style=style
+                        )
+                        info = ldpreload.ElfReader.parse(data)
+                        self.assertEqual(info.bits, bits)
+                        self.assert_dynamic_complete(info)
+
+    def test_eight_byte_hash_words_of_s390_and_alpha(self):
+        for machine in (22, 0x9026):
+            with self.subTest(machine=machine):
+                data = build_elf(
+                    self.SYMBOLS, endian=">", machine=machine, hash_word=8
+                )
+                self.assert_dynamic_complete(ldpreload.ElfReader.parse(data))
+        # The same table on another machine is read as 4-byte words: nbucket
+        # 0 and nchain 1, which the section headers contradict.
+        data = build_elf(self.SYMBOLS, endian=">", hash_word=8)
+        self.assertTrue(ldpreload.ElfReader.parse(data).incomplete)
+
+    def test_mutated_images_never_raise(self):
+        # Random byte changes to every kind of image the builder makes; the
+        # parser returns what it read, whatever the bytes.
+        rng = random.Random(18)
+        images = [
+            build_elf(self.SYMBOLS, bits=bits, endian=endian, hash_style=style)
+            for bits in (32, 64)
+            for endian in ("<", ">")
+            for style in ("sysv", "gnu", "both")
+        ]
+        started = time.monotonic()
+        for _ in range(600):
+            image = bytearray(rng.choice(images))
+            for _ in range(rng.randint(1, 8)):
+                position = rng.randrange(len(image))
+                image[position] = rng.choice((0, 0xFF, rng.randrange(256)))
+            self.assertIsInstance(ldpreload.ElfReader.parse(bytes(image)), ldpreload.ElfInfo)
+        # Generous: catches an endless loop, not a slow shared CI runner.
+        self.assertLess(time.monotonic() - started, PARSE_ALL_SECONDS)
+
+    def test_addresses_are_mapped_through_pt_load(self):
+        for style in ("sysv", "gnu"):
+            with self.subTest(style):
+                data = build_elf(self.SYMBOLS, hash_style=style, vaddr_base=0x400000)
+                self.assert_dynamic_complete(ldpreload.ElfReader.parse(data))
+
+    def test_without_section_headers_the_dynamic_segment_is_complete(self):
+        # sstrip: no section headers at all, nothing to cross-check; the
+        # loader does not need them and neither does the reader.
+        for style in ("sysv", "gnu"):
+            with self.subTest(style):
+                data = build_elf(self.SYMBOLS, strip_sections=True, hash_style=style)
+                self.assert_dynamic_complete(ldpreload.ElfReader.parse(data))
+
+    def test_section_headers_not_recovered_are_no_disagreement(self):
+        # Headers cut off at the end of the recovered content say nothing.
+        data = build_elf(self.SYMBOLS)
+        self.assert_dynamic_complete(ldpreload.ElfReader.parse(data[:-10]))
+
+    def test_uncached_section_headers_are_no_disagreement(self):
+        # A header table on a page that was not cached reads as zeros: no
+        # .dynsym is listed, which is not the file's claim.
+        # Padded so that the header table starts a page of its own.
+        shoff = build_elf_layout(self.SYMBOLS, rodata=b"x" * 8192)[1]["shoff"]
+        rodata = b"x" * (8192 + -shoff % 4096)
+        data, offsets = build_elf_layout(self.SYMBOLS, rodata=rodata)
+        shoff = offsets["shoff"]
+        self.assertEqual(shoff % 4096, 0)
+        holed = data[:shoff] + b"\x00" * 4096
+        info = ldpreload.ElfReader.parse(holed)
+        self.assertEqual(info.notes, [])
+        self.assertFalse(info.incomplete)
+
+    def test_forged_section_headers_are_reported(self):
+        patched = ForgedSymbolTableTests.patched_dynsym
+        data, offsets = build_elf_layout(self.SYMBOLS)
+        for label, forged, detail in (
+            ("empty .dynsym", patched(data, sh_size=0), "symbols, not"),
+            ("no .dynsym", patched(data, sh_type=SHT_PROGBITS), "no .dynsym"),
+            (".symtab only", patched(data, sh_type=2), "no .dynsym"),
+            ("moved .dynsym", patched(data, sh_offset=offsets["rodata"]), ".dynsym at"),
+            # Two of eight entries: readdir and open only.
+            ("short .dynsym", patched(data, sh_size=3 * 24), "only in the dynamic segment"),
+        ):
+            with self.subTest(label):
+                info = ldpreload.ElfReader.parse(forged)
+                self.assertEqual(info.source, "dynamic")
+                # The loader's view, not the headers'.
+                self.assertEqual(info.exported, self.EXPORTS)
+                self.assertTrue(info.incomplete)
+                (note,) = info.notes
+                self.assertIn(self.DISAGREE, note)
+                self.assertIn(detail, note)
+
+    def test_other_exports_in_the_section_headers_are_reported(self):
+        # .dynsym points at a decoy table (kept in .rodata) of the same names
+        # in which hide_me is global; the loader's table has it local.
+        hidden = [
+            (name, kind, STB_LOCAL if name == "hide_me" else binding, defined)
+            for name, kind, binding, defined in self.SYMBOLS
+        ]
+        listed, listed_at = build_elf_layout(self.SYMBOLS)
+        decoy = listed[listed_at["dynsym"] : listed_at["dynsym"] + 8 * 24]
+        data, offsets = build_elf_layout(hidden, rodata=decoy)
+        forged = ForgedSymbolTableTests.patched_dynsym(data, sh_offset=offsets["rodata"])
+        info = ldpreload.ElfReader.parse(forged)
+        self.assertEqual(info.exported, ["fopen", "open", "readdir", "secret_table"])
+        self.assertTrue(info.incomplete)
+        (note,) = info.notes
+        self.assertIn(self.DISAGREE, note)
+        self.assertIn("only in .dynsym: 'hide_me'", note)
+
+    def test_names_in_the_cross_check_note_are_quoted_and_bounded(self):
+        # Forged names in the disagreement note: each cut to 64 characters
+        # and quoted, so "; " or ")" in a name reads as part of it; the whole
+        # note bounded.
+        # Only in the dynamic table (global there, local in the decoy) ...
+        mine = ["a; b) c", "b" * 300] + [f"w{n}" + "v" * 200 for n in range(4)]
+        # ... and only in the decoy .dynsym.
+        theirs = [f"z{n:02}" + "y" * 200 for n in range(10)]
+        dynamic = [(name, STT_FUNC, STB_GLOBAL, True) for name in mine] + [
+            (name, STT_FUNC, STB_LOCAL, True) for name in theirs
+        ]
+        listed = [(name, STT_FUNC, STB_LOCAL, True) for name in mine] + [
+            (name, STT_FUNC, STB_GLOBAL, True) for name in theirs
+        ]
+        source, source_at = build_elf_layout(listed)
+        decoy = source[source_at["dynsym"] : source_at["dynsym"] + (len(listed) + 1) * 24]
+        data, offsets = build_elf_layout(dynamic, rodata=decoy)
+        forged = ForgedSymbolTableTests.patched_dynsym(data, sh_offset=offsets["rodata"])
+        info = ldpreload.ElfReader.parse(forged)
+        self.assertEqual(info.source, "dynamic")
+        self.assertEqual(info.exported, sorted(mine))
+        self.assertTrue(info.incomplete)
+        (note,) = info.notes
+        self.assertTrue(note.startswith(self.DISAGREE + " ("))
+        detail = note[len(self.DISAGREE) + 2 : -1]
+        self.assertLessEqual(len(detail), ldpreload.NOTE_DISAGREEMENT_MAX)
+        self.assertTrue(detail.endswith("..."))
+        self.assertIn("only in the dynamic segment: 'a; b) c', 'bbb", note)
+        self.assertIn("'" + "b" * 61 + "...'", note)
+        self.assertNotIn("b" * 62, note)
+        self.assertIn("(+1 more)", note)
+        quote = ldpreload._quote_name
+        self.assertEqual(quote("open"), "'open'")
+        self.assertEqual(len(quote("z" * 1000)), 64 + 2)
+        self.assertEqual(quote("it's"), '"it\'s"')
+
+    def test_no_pt_dynamic_falls_back_to_section_headers(self):
+        data, offsets = build_elf_layout(self.SYMBOLS)
+        info = ldpreload.ElfReader.parse(patch_phdr(data, offsets, 1, "type", 0))
+        self.assert_fallback(info)
+        self.assertEqual(info.exported, self.EXPORTS)
+
+    def test_dynamic_pointers_outside_the_data(self):
+        data, offsets = build_elf_layout(self.SYMBOLS, hash_style="both")
+        for tag in (DT_SYMTAB, DT_STRTAB, DT_HASH, DT_GNU_HASH):
+            for value in (len(data) + 0x10000, (1 << 64) - 8):
+                with self.subTest(tag=tag, value=value):
+                    info = ldpreload.ElfReader.parse(
+                        patch_dynamic(data, offsets, tag, value)
+                    )
+                    self.assertTrue(info.incomplete)
+        # Neither hash table: no symbol count.
+        data, offsets = build_elf_layout(self.SYMBOLS)
+        self.assert_fallback(
+            ldpreload.ElfReader.parse(
+                patch_dynamic(data, offsets, DT_HASH, new_tag=0x70000000)
+            )
+        )
+        # A string table size beyond the file. The loader does not use
+        # DT_STRSZ to read names, so a forged one must not hand the verdict to
+        # the section headers (which anyone can rewrite): the dynamic table is
+        # still read, its mapped part checked, and the read is incomplete.
+        info = ldpreload.ElfReader.parse(patch_dynamic(data, offsets, DT_STRSZ, 1 << 40))
+        self.assert_dynamic_incomplete(info)
+        self.assertIn("DT_STRSZ 0x10000000000 reaches past its segment", info.notes)
+
+    def assert_dynamic_incomplete(self, info):
+        """Read through the dynamic table, with its exports, but flagged."""
+        self.assertTrue(info.valid)
+        self.assertEqual(info.source, "dynamic")
+        self.assertEqual(info.exported, self.EXPORTS)
+        self.assertTrue(info.incomplete)
+
+    def test_wrong_symbol_entry_size(self):
+        # The loader ignores DT_SYMENT; entries have the class's size.
+        data, offsets = build_elf_layout(self.SYMBOLS)
+        info = ldpreload.ElfReader.parse(patch_dynamic(data, offsets, DT_SYMENT, 16))
+        self.assert_dynamic_incomplete(info)
+        self.assertEqual(info.notes, ["DT_SYMENT 16 is not 24"])
+
+    def test_the_last_of_several_pt_dynamic_is_read(self):
+        # glibc keeps the last PT_DYNAMIC; the first one here points at an
+        # empty dynamic table (a lone DT_NULL) in .rodata.
+        data, offsets = build_elf_layout(self.SYMBOLS, rodata=b"\x00" * 16 + b"x" * 48)
+        dynamic = offsets["dynamic"]
+        image = with_phdrs(data, offsets, [(PT_DYNAMIC, dynamic, dynamic, 0x70)])
+        image = patch_phdr(image, {"phdr": len(data)}, 1, "vaddr", offsets["rodata"])
+        info = ldpreload.ElfReader.parse(image)
+        self.assert_dynamic_incomplete(info)
+        self.assertEqual(info.notes, ["2 PT_DYNAMIC program headers; the last is read"])
+        # The decoy last: no table, no fallback to a first-match.
+        image = with_phdrs(data, offsets, [(PT_DYNAMIC, 0, offsets["rodata"], 0x40)])
+        info = ldpreload.ElfReader.parse(image)
+        self.assert_fallback(info)
+        self.assertIn("2 PT_DYNAMIC program headers; the last is read", info.notes)
+
+    def test_dynamic_segment_without_dt_null(self):
+        data, offsets = build_elf_layout(self.SYMBOLS)
+        # The segment ends where the entries end, and the last is no DT_NULL.
+        end = offsets["phdr"]
+        unterminated = patch_dynamic(data, offsets, DT_NULL, new_tag=0x70000000)
+        unterminated = patch_phdr(unterminated, offsets, 0, "filesz", end)
+        info = ldpreload.ElfReader.parse(unterminated)
+        self.assert_fallback(info)
+        self.assertIn("dynamic segment has no DT_NULL terminator", info.notes)
+        # More entries than are walked.
+        with mock.patch.object(ldpreload, "ELF_DYNAMIC_MAX", 3):
+            info = ldpreload.ElfReader.parse(data)
+        self.assert_fallback(info)
+        self.assertIn("dynamic segment has no DT_NULL terminator", info.notes)
+
+    def test_huge_hash_counts(self):
+        data, offsets = build_elf_layout(self.SYMBOLS)
+        for label, position, value in (
+            ("nbucket", 0, 0xFFFFFFFF),
+            ("nchain", 4, 0xFFFFFFFF),
+            ("nchain past the data", 4, 0x10000),
+        ):
+            with self.subTest(label):
+                image = bytearray(data)
+                struct.pack_into("<I", image, offsets["hash"] + position, value)
+                started = time.monotonic()
+                self.assert_fallback(ldpreload.ElfReader.parse(bytes(image)))
+                self.assertLess(time.monotonic() - started, PARSE_SECONDS)
+        data, offsets = build_elf_layout(self.SYMBOLS, hash_style="gnu")
+        gnu = offsets["gnu_hash"]
+        bucket = gnu + 16 + 8  # header, one 64-bit bloom word
+        for label, position, value in (
+            ("nbuckets", gnu, 0xFFFFFFFF),
+            ("bloom size", gnu + 8, 0xFFFFFFFF),
+            ("bucket", bucket, 0xFFFFFFF0),
+            ("bucket below symoffset", gnu + 4, 5),
+        ):
+            with self.subTest(label):
+                image = bytearray(data)
+                struct.pack_into("<I", image, position, value)
+                started = time.monotonic()
+                self.assert_fallback(ldpreload.ElfReader.parse(bytes(image)))
+                self.assertLess(time.monotonic() - started, PARSE_SECONDS)
+
+    def test_gnu_hash_chain_without_an_end(self):
+        data, offsets = build_elf_layout(self.SYMBOLS, hash_style="gnu")
+        chain = offsets["gnu_hash"] + 16 + 8 + 4
+        image = bytearray(data)
+        for index in range(len(self.SYMBOLS)):
+            struct.pack_into("<I", image, chain + 4 * index, 2)  # all even
+        # The walk runs on into what follows the chain; whatever it ends on,
+        # the count no longer matches.
+        info = ldpreload.ElfReader.parse(bytes(image))
+        self.assertTrue(info.incomplete)
+        # A chain longer than the symbol cap is not walked to its end.
+        with mock.patch.object(ldpreload, "ELF_SYMBOL_MAX", 3):
+            info = ldpreload.ElfReader.parse(bytes(image))
+        self.assertTrue(info.incomplete)
+        # One that runs off its segment has no count at all.
+        end = chain + 4 * len(self.SYMBOLS)
+        amap = ldpreload._AddressMap([(0, 0, end)], 64)
+        self.assertIsNone(
+            ldpreload.ElfReader._gnu_hash_count(
+                bytes(image), "<", 64, amap, offsets["gnu_hash"]
+            )
+        )
+
+    def test_nchain_smaller_than_the_chains_reach(self):
+        # The loader follows buckets and chains without checking them against
+        # nchain; an nchain of 1 would otherwise read as "defines nothing".
+        data, offsets = build_elf_layout(self.SYMBOLS, strip_sections=True)
+        image = bytearray(data)
+        struct.pack_into("<I", image, offsets["hash"] + 4, 1)
+        info = ldpreload.ElfReader.parse(bytes(image))
+        self.assertTrue(info.incomplete)
+        # What the chains reach is read all the same.
+        self.assertEqual(info.exported, self.EXPORTS)
+        self.assertIn("DT_HASH chains reach past nchain 1", " ".join(info.notes))
+
+    def test_string_table_size_does_not_hide_names(self):
+        # The loader reads names without regard to DT_STRSZ; a size of 1 must
+        # not turn every export into an empty name that is skipped.
+        data, offsets = build_elf_layout(self.SYMBOLS, strip_sections=True)
+        info = ldpreload.ElfReader.parse(patch_dynamic(data, offsets, DT_STRSZ, 1))
+        self.assertEqual(info.exported, self.EXPORTS)
+        # A name that cannot be read at all leaves the read incomplete.
+        image = bytearray(data)
+        struct.pack_into("<I", image, offsets["dynsym"] + 24, 0xFFFFFF)  # readdir's st_name
+        info = ldpreload.ElfReader.parse(bytes(image))
+        self.assertTrue(info.incomplete)
+
+    def test_hash_tables_disagreeing(self):
+        data, offsets = build_elf_layout(self.SYMBOLS, hash_style="both")
+        image = bytearray(data)
+        struct.pack_into("<I", image, offsets["hash"] + 4, len(self.SYMBOLS) + 2)
+        info = ldpreload.ElfReader.parse(bytes(image))
+        self.assertTrue(info.incomplete)
+        self.assertIn("DT_HASH and DT_GNU_HASH disagree", " ".join(info.notes))
+
+    def test_gnu_hash_without_hashed_symbols(self):
+        # An object that defines nothing: no bucket is used and symoffset is
+        # only a lower bound, which a .dynsym of more entries does not contradict.
+        for style in ("gnu", "both"):
+            with self.subTest(style):
+                info = ldpreload.ElfReader.parse(build_elf([], hash_style=style))
+                self.assert_dynamic_complete(info, exported=[])
+        imports = [("write", STT_FUNC, STB_GLOBAL, False), ("read", STT_FUNC, STB_GLOBAL, False)]
+        data, offsets = build_elf_layout(imports, hash_style="gnu")
+        image = bytearray(data)
+        struct.pack_into("<I", image, offsets["gnu_hash"] + 16 + 8, 0)  # empty bucket
+        info = ldpreload.ElfReader.parse(bytes(image))
+        self.assert_dynamic_complete(info, exported=[])
+
+    def test_huge_program_header_count(self):
+        data = bytearray(build_elf(self.SYMBOLS))
+        struct.pack_into("<H", data, 56, 0xFFFF)
+        started = time.monotonic()
+        info = ldpreload.ElfReader.parse(bytes(data))
+        self.assertLess(time.monotonic() - started, PARSE_SECONDS)
+        self.assert_fallback(info)
+        self.assertIn("implausible program header count 65535", info.notes)
+        struct.pack_into("<H", data, 54, 0)  # e_phentsize
+        struct.pack_into("<H", data, 56, 2)
+        self.assert_fallback(ldpreload.ElfReader.parse(bytes(data)))
+
+    def test_segment_overflow_and_unmappable_addresses(self):
+        data, offsets = build_elf_layout(self.SYMBOLS)
+        top = 1 << 64
+        for label, fields in (
+            ("p_offset wraps", {"offset": top - 0x10}),
+            ("p_filesz wraps", {"filesz": top - 1, "offset": 0x10, "vaddr": 0x10}),
+            ("p_vaddr wraps", {"vaddr": top - 0x10}),
+            ("p_vaddr elsewhere", {"vaddr": 0x10000000}),
+        ):
+            with self.subTest(label):
+                image = data
+                for field, value in fields.items():
+                    image = patch_phdr(image, offsets, 0, field, value)
+                self.assert_fallback(ldpreload.ElfReader.parse(image))
+        # PT_DYNAMIC at an address no PT_LOAD maps.
+        self.assert_fallback(
+            ldpreload.ElfReader.parse(patch_phdr(data, offsets, 1, "vaddr", 0x10000000))
+        )
+
+    def test_32_bit_segment_overflow(self):
+        data, offsets = build_elf_layout(self.SYMBOLS, bits=32)
+        image = bytearray(data)
+        struct.pack_into("<I", image, offsets["phdr"] + 4, 0xFFFFFFF0)  # p_offset
+        info = ldpreload.ElfReader.parse(bytes(image))
+        self.assert_fallback(info)
+
+    def test_overlapping_segments_are_ambiguous(self):
+        amap = ldpreload._AddressMap([(0, 0, 0x100), (0, 0x1000, 0x100)], 64)
+        self.assertIsNone(amap.offset(0x10, 8))
+        self.assertTrue(amap.ambiguous)
+        amap = ldpreload._AddressMap([(0, 0, 0x100), (0x80, 0x80, 0x100)], 64)
+        self.assertEqual(amap.offset(0x90, 8), (0x90, 0x100))
+        self.assertFalse(amap.ambiguous)
+        # The range has to lie within one segment's file part.
+        self.assertIsNone(amap.offset(0xF0, 0x100))
+        self.assertFalse(amap.ambiguous)
+
+    def test_overlap_is_judged_per_page(self):
+        # The loader maps whole pages, a later segment over an earlier one:
+        # a page another segment fills with other file bytes is ambiguous
+        # even where that segment's file part does not reach.
+        P = 0x1000
+        # Partial overlap: B's file part covers half of A's second page.
+        a, b = (0, 0, 2 * P), (P + 0x800, 5 * P + 0x800, 0x800)
+        amap = ldpreload._AddressMap([a, b], 64)
+        self.assertEqual(amap.offset(0x100, 8), (0x100, 2 * P))  # page 0: A only
+        self.assertFalse(amap.ambiguous)
+        self.assertIsNone(amap.offset(P + 0x10, 8))  # A's bytes, B's page
+        self.assertTrue(amap.ambiguous)
+        amap = ldpreload._AddressMap([a, b], 64)
+        self.assertIsNone(amap.offset(P + 0x900, 8))  # inside both
+        self.assertTrue(amap.ambiguous)
+        # A range on page 0 reaching into the shared page.
+        amap = ldpreload._AddressMap([a, b], 64)
+        self.assertIsNone(amap.offset(P - 8, 16))
+        self.assertTrue(amap.ambiguous)
+        # Adjacent segments sharing a page, the range across their boundary:
+        # in neither file part alone.
+        c, d = (0, 0, P + 0x800), (P + 0x800, 3 * P + 0x800, 0x800)
+        amap = ldpreload._AddressMap([c, d], 64)
+        self.assertIsNone(amap.offset(P + 0x7F8, 16))
+        self.assertIsNone(amap.offset(P + 0x100, 8))  # c's bytes, d's page
+        self.assertTrue(amap.ambiguous)
+        # The linker's layout: segments sharing a page with the same
+        # vaddr - offset put the same bytes there; a data segment whose
+        # difference differs lives on pages of its own.
+        amap = ldpreload._AddressMap(
+            [(0, 0, 0x5F0), (0x5F0, 0x5F0, 0x1A10), (0x2E10, 0x1E10, 0x230)], 64
+        )
+        self.assertEqual(amap.offset(0x5E8, 0x10), None)  # across a boundary
+        self.assertEqual(amap.offset(0x5F0, 0x10), (0x5F0, 0x2000))
+        self.assertEqual(amap.offset(0x100, 0x10), (0x100, 0x5F0))
+        self.assertEqual(amap.offset(0x2E20, 8), (0x1E20, 0x2040))
+        self.assertFalse(amap.ambiguous)
+        # p_align is not the page size: a 2 MiB alignment does not widen pages.
+        amap = ldpreload._AddressMap([(0, 0, 0x1000), (0x201000, 0x1000, 0x100)], 64)
+        self.assertEqual(amap.offset(0xFF8, 8), (0xFF8, 0x1000))
+        self.assertFalse(amap.ambiguous)
+
+    def test_address_map_of_many_segments_stays_fast(self):
+        # Every export's name is looked up through the map: 512 forged,
+        # interleaved segments and 65536 lookups must not multiply.
+        loads = [(n * 0x1800, n * 0x1800, 0x2000 + n) for n in range(512)]
+        started = time.monotonic()
+        amap = ldpreload._AddressMap(loads, 64)
+        for n in range(65536):
+            address = (n * 0x2F3) % (512 * 0x1800)
+            self.assertEqual(amap.offset(address, 8)[0], address)
+        self.assertFalse(amap.ambiguous)
+        self.assertLess(time.monotonic() - started, PARSE_SECONDS)
+
+    def test_a_shared_page_with_other_bytes_makes_the_table_untrusted(self):
+        data, offsets = build_elf_layout(self.SYMBOLS, rodata=b"x" * 0x40)
+        self.assertLess(len(data), 0x1000)  # every table on page 0
+        rodata = offsets["rodata"]
+        # A second PT_LOAD over 16 bytes of .rodata, from elsewhere in the
+        # file: it reaches no table, but its page holds all of them.
+        image = with_phdrs(data, offsets, [(PT_LOAD, 0x2000, rodata, 0x10)])
+        info = ldpreload.ElfReader.parse(image)
+        self.assert_fallback(info)
+        self.assertIn(
+            "overlapping PT_LOAD segments map a dynamic table ambiguously", info.notes
+        )
+        # The same bytes again (same vaddr - offset): nothing to doubt.
+        image = with_phdrs(data, offsets, [(PT_LOAD, rodata, rodata, 0x10)])
+        self.assert_dynamic_complete(ldpreload.ElfReader.parse(image))
+
+    def test_names_are_read_through_the_segments(self):
+        # The loader reads a name at DT_STRTAB + st_name in memory. Here that
+        # address lies in a second PT_LOAD that maps .rodata far above the
+        # first one, beyond DT_STRSZ; the file offset .dynstr + st_name is
+        # past the end of the file.
+        base, high = 0x400000, 0x500000
+        data, offsets = build_elf_layout(
+            [("placeholder", STT_FUNC, STB_GLOBAL, True)],
+            rodata=b"readdir\x00",
+            strip_sections=True,
+            vaddr_base=base,
+        )
+        rodata = offsets["rodata"]
+        page = rodata - rodata % 0x1000
+        st_name = high + rodata - (base + offsets["dynstr"])
+        self.assertGreater(offsets["dynstr"] + st_name, len(data))
+        image = bytearray(data)
+        struct.pack_into("<I", image, offsets["dynsym"] + 24, st_name)
+        image = bytes(image)
+
+        def parse(filesz, *extra):
+            load = (PT_LOAD, page, high + page, rodata - page + filesz)
+            return ldpreload.ElfReader.parse(with_phdrs(image, offsets, [load, *extra]))
+
+        info = parse(8)
+        self.assertEqual(info.source, "dynamic")
+        self.assertEqual(info.interposed(), ["readdir"])
+        self.assertEqual(info.notes, [])
+        self.assertFalse(info.incomplete)
+        # The name runs off the segment's file part before its NUL.
+        info = parse(4)
+        self.assertEqual(info.exported, [])
+        self.assertTrue(info.incomplete)
+        # Another segment fills the name's page with other bytes.
+        info = parse(8, (PT_LOAD, 0x3000, high + page + 0x800, 0x10))
+        self.assertEqual(info.exported, [])
+        self.assertTrue(info.incomplete)
+        self.assertIn("overlapping PT_LOAD segments map a symbol name ambiguously", info.notes)
+        # Not mapped at all.
+        info = ldpreload.ElfReader.parse(with_phdrs(image, offsets, []))
+        self.assertEqual(info.exported, [])
+        self.assertTrue(info.incomplete)
+
+    def test_uncached_page_of_the_dynamic_table_is_incomplete(self):
+        # The dynamic table straddles a page boundary after DT_STRSZ; an
+        # uncached second page reads as an early DT_NULL and still leaves
+        # every tag a read needs.
+        first = build_elf_layout(self.SYMBOLS, hash_style="both")[1]["dynamic"]
+        padding = -(first + 5 * 16) % 0x1000
+        data, offsets = build_elf_layout(
+            self.SYMBOLS, hash_style="both", rodata=b"x" * padding
+        )
+        boundary = offsets["dynamic"] + 5 * 16
+        self.assertEqual(boundary % 0x1000, 0)
+        # The program headers moved past the page, so that they stay readable.
+        image = with_phdrs(data, offsets, [], at=boundary + 0x1000)
+        self.assert_dynamic_complete(ldpreload.ElfReader.parse(image))
+        holed = image[:boundary] + b"\x00" * 0x1000 + image[boundary + 0x1000 :]
+        info = ldpreload.ElfReader.parse(holed)
+        self.assertEqual(info.source, "dynamic")
+        self.assertEqual(info.exported, self.EXPORTS)
+        self.assertTrue(info.incomplete)
+
+    AMBIGUOUS = "overlapping PT_LOAD segments map a dynamic table ambiguously"
+
+    def test_later_page_of_a_table_under_another_segment_is_ambiguous(self):
+        # Only a table's first bytes decide where it is; a later page that
+        # another segment fills with other bytes (a decoy entry, bucket or
+        # chain the loader would see) makes the table untrusted.
+        first = build_elf_layout(self.SYMBOLS, hash_style="both")[1]["dynamic"]
+        padding = -(first + 5 * 16) % 0x1000
+        data, offsets = build_elf_layout(
+            self.SYMBOLS, hash_style="both", rodata=b"x" * padding
+        )
+        boundary = offsets["dynamic"] + 5 * 16
+        image = with_phdrs(
+            data, offsets, [(PT_LOAD, 0x100, boundary + 0x100, 0x10)], at=boundary + 0x1000
+        )
+        info = ldpreload.ElfReader.parse(image)
+        self.assert_fallback(info)
+        self.assertIn(self.AMBIGUOUS, info.notes)
+        # Hash tables over several pages, the other segment over one inside.
+        symbols = [(f"filler{n:04}", STT_FUNC, STB_LOCAL, True) for n in range(3000)]
+        for style in ("sysv", "gnu"):
+            with self.subTest(style):
+                data, offsets = build_elf_layout(symbols + self.HOOK, hash_style=style)
+                start = offsets["hash" if style == "sysv" else "gnu_hash"]
+                page = start + -start % 0x1000
+                self.assertLessEqual(page + 0x1000, offsets["dynamic"])
+                self.assert_dynamic_complete(
+                    ldpreload.ElfReader.parse(with_phdrs(data, offsets, [])),
+                    exported=["readdir"],
+                )
+                image = with_phdrs(data, offsets, [(PT_LOAD, 0x100, page + 0x100, 0x10)])
+                info = ldpreload.ElfReader.parse(image)
+                self.assert_fallback(info)
+                self.assertIn(self.AMBIGUOUS, info.notes)
+
+    def test_uncached_symbol_string_or_hash_page_is_incomplete(self):
+        symbols = [(f"filler{n:04}", STT_FUNC, STB_LOCAL, True) for n in range(1500)]
+        for style in ("sysv", "gnu"):
+            data, offsets = build_elf_layout(symbols + self.HOOK, hash_style=style)
+            self.assert_dynamic_complete(
+                ldpreload.ElfReader.parse(data), exported=["readdir"]
+            )
+            table = offsets["hash" if style == "sysv" else "gnu_hash"]
+            for label, start in (
+                ("string table", offsets["dynstr"]),
+                ("symbol table", offsets["dynsym"]),
+                ("hash table", table),
+            ):
+                with self.subTest(style=style, table=label):
+                    page = (start + 4095) // 4096 * 4096
+                    holed = data[:page] + b"\x00" * 4096 + data[page + 4096 :]
+                    info = ldpreload.ElfReader.parse(holed)
+                    self.assertEqual(info.source, "dynamic")
+                    self.assertTrue(info.incomplete)
+
+    def test_forged_library_is_not_assumed_safe_and_says_why(self):
+        path = "/usr/lib64/libquiet.so"
+        helper = [("helper", STT_FUNC, STB_GLOBAL, True)]
+        honest = build_elf(helper)
+        forged = ForgedSymbolTableTests.patched_dynsym(honest, sh_size=0)
+        for label, data, benign in (("honest", honest, True), ("forged", forged, False)):
+            with self.subTest(label):
+                entry = ldpreload.PreloadEntry(
+                    preload_path="LD_PRELOAD",
+                    library=path,
+                    env_var="LD_PRELOAD",
+                    env_pids={100: "bash"},
+                    recovered=ldpreload.RecoveredFile(path=path, inode_addr=1, data=data),
+                    elf=ldpreload.ElfReader.parse(data),
+                )
+                plugin = make_plugin({"filter-safe-env": True, "skip-maps": True})
+                kept = plugin._assess_env_entries([entry])
+                self.assertEqual(entry.benign, benign)
+                if not benign:
+                    plugin._entries = kept
+                    ((_, row),) = plugin._generator()
+                    self.assertEqual(len(row), 7)
+                    self.assertIn(self.DISAGREE, row[6])
+                    self.assertIn("symbol table not fully readable", row[6])
+
+    def test_real_shared_objects_read_completely_and_consistently(self):
+        # Python's own extension modules and the libraries this process has
+        # mapped (libc, the loader, ...): real linker output on every system
+        # the tests run on. Each is read through its dynamic segment, in full,
+        # without a disagreement with its section headers.
+        import sysconfig
+
+        modules = set()
+        directory = pathlib.Path(sysconfig.get_config_var("DESTSHARED") or "")
+        if directory.is_dir():
+            modules.update(sorted(directory.glob("*.so"))[:100])
+        mapped = set()
+        maps = pathlib.Path("/proc/self/maps")
+        if maps.exists():
+            for line in maps.read_text().splitlines():
+                name = line.split(maxsplit=5)[5:]
+                if name and ".so" in name[0] and name[0].startswith("/"):
+                    mapped.add(pathlib.Path(name[0]))
+        seen = 0
+        for path in sorted(modules | mapped):
+            try:
+                data = path.read_bytes()
+            except OSError:
+                continue
+            if not data.startswith(b"\x7fELF"):
+                continue
+            seen += 1
+            with self.subTest(path.name):
+                dynsym = ldpreload.ElfReader.section_range(data, ".dynsym")
+                entry = 24 if data[4] == 2 else 16
+                if dynsym and dynsym[1] // entry > ldpreload.ELF_SYMBOL_MAX:
+                    # More symbols than are parsed: rightly incomplete.
+                    self.skipTest(f"{path.name}: more than ELF_SYMBOL_MAX symbols")
+                info = ldpreload.ElfReader.parse(data)
+                self.assertEqual(info.source, "dynamic")
+                self.assertEqual(info.notes, [])
+                self.assertFalse(info.incomplete)
+                if path in modules:
+                    self.assertTrue(info.exported)  # PyInit_<module>
+        if not seen:
+            self.skipTest("no shared objects found")
 
 
 @unittest.skipUnless(HAVE_FRAMEWORK, "volatility3 is not importable")
@@ -2051,7 +2966,7 @@ class RequirementTests(unittest.TestCase):
                 self.assertGreaterEqual(have[1:], wanted[1:], requirement.name)
 
     def test_plugin_version(self):
-        self.assertEqual(ldpreload.LdPreload._version, (1, 7, 0))
+        self.assertEqual(ldpreload.LdPreload._version, (1, 8, 0))
 
 
 if __name__ == "__main__":

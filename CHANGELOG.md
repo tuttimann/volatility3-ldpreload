@@ -3,6 +3,92 @@
 All notable changes to `linux.ldpreload` are documented here. Versions follow the
 plugin's `_version` tuple.
 
+## 1.8.0 (2026-11-20)
+
+- Changed: the dynamic symbol table is now located the way the loader locates it,
+  through the program headers: `PT_DYNAMIC` gives `DT_SYMTAB`, `DT_STRTAB`,
+  `DT_STRSZ` and `DT_SYMENT`, its addresses are mapped to file offsets through the
+  `PT_LOAD` segments' file parts, and the symbol count comes from `DT_GNU_HASH`
+  (one past the end of the chain the highest bucket starts) or `DT_HASH`
+  (`nchain`). Closes the item left open in 1.7.0: section headers, which the loader
+  never reads and anyone can rewrite, no longer decide what a library exports. A
+  library stripped of its section headers (`sstrip`) is now read in full.
+- Changed: the section headers' `.dynsym` is a cross-check. A different offset,
+  symbol count or set of exported symbols, or no `.dynsym` at all, is reported in
+  `Notes` ("section headers disagree with the dynamic segment (...)", naming the
+  symbols only one of them lists) and makes the read incomplete, so the library is
+  not assumed safe. Section headers that were not recovered (cut off, or on an
+  uncached page) are not a disagreement. Without a readable dynamic segment the
+  section headers are a fallback, as before, and never a complete read.
+- Changed: a library is assumed safe (and hidden by `--filter-safe-env`) only if its
+  table was read in full through the dynamic segment: hash table, symbol table and
+  string table without an uncached page, at least one symbol, no contradiction
+  between `DT_HASH` and `DT_GNU_HASH`, and a consistent cross-check.
+- The reader stays defensive and never raises. Forged values are bounded: at most
+  512 program headers (more marks the header table implausible), 4096 dynamic
+  entries (no `DT_NULL` within them, or within the segment, is noted), 2^20 hash
+  buckets and bloom words, and the GNU chain walk and the symbol read stop at 65536
+  symbols. Segments whose file part wraps the address or offset range map nothing;
+  a table on a page that two `PT_LOAD` segments fill with different file bytes is
+  noted and the dynamic table is not used. Buckets and chains are read in blocks,
+  not entry by entry.
+- Performance: resolving a preload line or environment name compared it with every
+  cached library path (suffix and basename matches). It is now compared only with
+  the cached paths of the same basename, from an index built once per run; the first
+  match, and so the result, is the same. Names with `$LIB`/`$PLATFORM` tokens still
+  go through the full matcher.
+- Fixed (review of this release): `nchain` of `DT_HASH` was taken as the symbol
+  count, but the loader follows buckets and chains without checking them against
+  it; an `nchain` of 1 made a library read as complete and exporting nothing.
+  Every symbol index the table names is now read, and one beyond `nchain` is noted
+  and makes the read incomplete. Names are read up to their NUL as the loader reads
+  them, not cut at `DT_STRSZ` (which could hide every export), and an export whose
+  name is not in the recovered content makes the read incomplete.
+- Fixed (second review of this release):
+  - Names are read where the loader reads them, at `DT_STRTAB + st_name` mapped
+    through the `PT_LOAD` segments (wholly within one segment's file part), not at
+    the file offset of `.dynstr` plus `st_name`, which differ once a name lies past
+    `DT_STRSZ` in another segment. A name no segment maps makes the read
+    incomplete. The section-header fallback still reads file offsets.
+  - Overlapping segments are judged per 4096-byte page, as the loader maps them
+    (a later segment over an earlier one), no longer only when a second segment
+    holds the whole range: a page another segment fills with different file bytes
+    (a different `vaddr - offset`) makes the range ambiguous, with a note. Segments
+    sharing a page with the same difference, as linkers lay them out, are fine.
+    The dynamic table (to its `DT_NULL`) and the hash tables are checked over their
+    whole extent, not only their first bytes.
+  - Exports are the global and weak definitions of every type glibc binds
+    (`NOTYPE`, `OBJECT`, `FUNC`, `COMMON`, `TLS`, `GNU_IFUNC`), not only `FUNC`: an
+    IFUNC or untyped `open` overrides libc's `open` too. `--all-symbols` and the
+    cross-check now cover data and TLS symbols as well.
+  - Values the loader ignores no longer hand the verdict to the section headers: a
+    `DT_STRSZ` past its segment is cut to the mapped part, a wrong `DT_SYMENT` is
+    read with the class's entry size, and of several `PT_DYNAMIC` the last is read
+    (as glibc does). Each is noted and makes the read incomplete; the exports come
+    from the dynamic table.
+  - An uncached page of the dynamic table itself (which reads as an early
+    `DT_NULL`) makes the read incomplete.
+  - Symbol names in the cross-check note are quoted and cut to 64 characters, and
+    the note to 512, so a forged name cannot pose as another note.
+- Tests: 37 new tests. The ELF ones build 32- and 64-bit, little- and big-endian images with
+  `DT_HASH`, `DT_GNU_HASH` or both and cover forged section headers, the fallback,
+  and forged dynamic data (pointers outside the file, no `DT_NULL`, huge counts,
+  endless GNU chains, `e_phnum` 65535, wrapping segments, unmappable and ambiguous
+  addresses, uncached pages in each table); one parses the shared objects of the
+  Python running the tests (its `lib-dynload` modules, libc, the loader) and expects
+  each to be read completely and consistently (an object with more symbols than
+  are parsed is skipped), and one feeds 600 randomly mutated images to the parser,
+  which must never raise. Others cover names mapped through a second segment,
+  page-granular overlaps, every bound symbol type, several `PT_DYNAMIC`, an
+  uncached dynamic-table page, quoted note names, and 512 segments with 65536 name
+  lookups. Their wall-clock bounds (10 s per parse, 30 s for the mutations) only
+  catch endless loops, not slow CI runners. Another checks the indexed library
+  lookup against the linear one on random input. The test image builder now emits
+  program headers and a dynamic segment; the existing tests that are about images
+  with section headers only build them without (`dynamic=False`).
+- CI: a job installs the minimum framework version, `volatility3==2.26.0`, on
+  Python 3.12 and runs the byte-compile, load check and unit tests against it.
+
 ## 1.7.0 (2026-11-20)
 
 - Fixed (review): the pattern deciding whether a token names a shared object
