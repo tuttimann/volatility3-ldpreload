@@ -76,6 +76,52 @@ plugin's `_version` tuple.
   hanging the suite. CI also runs the plugin's load check (`vol -p . ... --help`)
   and adds Python 3.14.
 
+Second review round (same version):
+
+- Fixed (review): the shared-object pattern was still quadratic when searched
+  unanchored. A 60 KiB `LD_PRELOAD` name made of `.so` repeated, ending in a tab
+  (which the loader-exact splitting now leaves in the name), took 15 s to assess,
+  and an environment block may be 1 MiB. The question is now answered with string
+  operations in linear time; the answers are the same for every input.
+- Fixed (review): the recovered content of a file ends with its last cached page.
+  A dynamic linker whose tail (section headers included) was not cached, and whose
+  cached part does not hold `/etc/ld.so.preload`, was reported as patched. A loader
+  whose `.rodata` cannot be located (no section headers) or reaches past the
+  recovered content is now inconclusive when it was recovered shorter than its
+  `i_size`, its `i_size` cannot be read or it was cut at the read budget. A loader
+  whose `.rodata` is located and lies wholly in the recovered content is still
+  judged, whatever else of the file is missing: patched, or inconclusive only if
+  a page inside `.rodata` is not cached.
+- Fixed (review): the read budgets were per file, so any number of sparse files
+  under names the plugin reads were each read and kept in full. All budgeted reads
+  of one run now share a total of 1 GiB (`TOTAL_READ_MAX_SIZE`, a constant). Once
+  it is used up, a file is read only up to what is left, or not at all; its row
+  says so in `Notes` and a warning is logged once. Content-scan candidates that
+  turn out not to be preload files do not count.
+- Fixed (review, partial): a library with no `.dynsym`, or with one of zero
+  entries, was taken as fully read and exporting nothing, and so could be assumed
+  safe. Section headers are written by whoever wrote the file; such a table now
+  counts as not fully readable (`-`, with a note, and never assumed safe). Symbols
+  from a `.symtab` fallback are still listed. Open: the dynamic segment, which is
+  what the loader goes by, is still not parsed, so headers pointing at a
+  plausible but different table are not detected.
+- Fixed (regression in 1.7.0): since names are split as the loader splits them,
+  they can contain newlines, tabs and other control characters, which went into
+  the output cells and log lines as they were and could fake rows or columns.
+  Control characters (C0, DEL, C1, U+2028/U+2029) are now shown as `\n`, `\t`,
+  `\r` or `\xNN` in every cell, timeline description and log message of the
+  plugin, task names (`comm`) and symbol names included. Internally, and for
+  resolving a library, the name is unchanged; so are the columns.
+- Fixed (review): a task, mount or mapping walk that died on a read error ended
+  silently. It now logs a warning naming the walk and the error, since the entries
+  after that point are missing from the result.
+- Fixed (review): a file whose `i_size` cannot be read was read up to its budget
+  without any mark. Its note now says that the size was unreadable, and it counts
+  as truncated when the content fills the budget (so the content scan discards
+  it).
+- Tests: 23 more (21 fail against the first 1.7.0 state, two are guards for
+  behaviour that must not change). The 1 MiB inputs must finish within a second.
+
 ## 1.6.0 (2026-10-07)
 
 - Fixed: the string scan of a patched loader skipped every second absolute path in

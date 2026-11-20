@@ -192,6 +192,12 @@ File                       Library                                    Overridden
 A clean system produces an empty table and an informational log line saying that no
 preload file is present.
 
+File names, preload entries, environment values, task names and symbol names can
+contain control characters (the loader does not split an `LD_PRELOAD` value at a tab,
+and a file name may hold a newline). In every cell and log line they are shown
+escaped (`\n`, `\t`, `\r`, `\xNN`), so that a name cannot fake a row or a column;
+internally, and for resolving a library, the name is used as it is.
+
 ### Reading the result
 
 - **Overridden Functions** is the finding. `readdir`/`readdir64`/`getdents` hide
@@ -226,13 +232,14 @@ preload file is present.
    resolves to a cached object, is mapped by a process, or is named by a patched loader.
 3. **Loader integrity.** Each glibc loader (`ld-linux*.so.N`, `ld-2.xx.so`, `ld64.so.N`,
    `ld.so.N`, any directory) is read and searched for `/etc/ld.so.preload`. If absent
-   and its `.rodata` is fully cached, it is patched; the replacement is recovered from a
+   and the loader was recovered up to its full size with its `.rodata` fully cached,
+   it is patched; the replacement is recovered from a
    same-directory leftover copy by byte diff, or from the loader's `/`-strings minus
    the stock ones, cross-checked against the page cache.
 4. **ELF parsing.** A small defensive reader parses `.dynsym` from the recovered image
    (holes allowed) and keeps global `FUNC` definitions. It records whether the table
-   was read in full; a missing section header table or an uncached page of the
-   symbols makes the result "unknown", not "none".
+   was read in full; a missing section header table, an uncached page of the
+   symbols, or no or an empty `.dynsym` makes the result "unknown", not "none".
 5. **Process correlation.** Each task's VMAs are followed with raw reads
    (`vma → vm_file → dentry`); a wanted library is recognised by inode address, and only
    a matching basename pays for full path reconstruction. A library no cached dentry
@@ -271,14 +278,28 @@ forwarder, which sets `LD_PRELOAD` for its own processes, produce no false posit
 - `.dynsym` is located through the section header table at the end of the file. A
   library without one (stripped), or whose last pages are not cached, is reported
   with an unknown function list (`-`, and a note); the dynamic segment is not parsed
-  as a fallback.
+  as a fallback. The same goes for a library with no `.dynsym` or an empty one.
+  Section headers are not what the loader uses, and whoever wrote the file controls
+  them: headers that point at a plausible but different symbol table are not
+  detected.
 - Every file read has a size budget, so that a sparse or smeared inode cannot make
   the plugin allocate its declared size: 1 MiB for a preload file, 32 MiB for a
   dynamic linker or a leftover copy, 256 MiB for a library. A larger file is read up
   to its budget and the note says so. That partial read uses the compatibility
-  reader, which covers the Intel `vmemmap` layout only.
+  reader, which covers the Intel `vmemmap` layout only. All these reads of one run
+  share a total of 1 GiB (`TOTAL_READ_MAX_SIZE` in the plugin, not a command-line
+  option); once it is used up, further files are read partially or not at all, a
+  warning is logged and the affected rows say so in `Notes`. A file whose size
+  cannot be read is read up to its budget and noted as such.
 - The loader check covers glibc; musl has no preload file. A loader whose `.rodata`
-  pages are not all cached is reported as inconclusive, never guessed at.
+  pages are not all cached is logged as inconclusive, never guessed at, and gets
+  no row. So is one whose `.rodata` cannot be located or reaches past the
+  recovered content, if it was recovered shorter than its size (its last pages
+  are not cached), cut at the read budget, or its size cannot be read. A missing
+  tail alone does not matter once `.rodata` is located and fully recovered.
+- A task, mount or mapping list that cannot be walked to its end (a smeared image)
+  is used as far as it goes; a warning says which walk was cut short, and the
+  result may be incomplete.
 - Physical-address translation of `struct page` in the fast paths uses the Intel
   `vmemmap` layout; on other architectures the plugin falls back to the framework's
   object-based reader (slower, same result).

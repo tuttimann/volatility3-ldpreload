@@ -142,6 +142,54 @@ from volatility3.plugins.linux import pagecache, pslist
 
 vollog = logging.getLogger(__name__)
 
+# File names, preload tokens, environment values, task names and symbol names
+# are whatever the imaged system holds, control characters included: a newline
+# or tab in one of them would start a new line or column in the rendered table
+# or in a log line. They are kept raw internally (resolution compares them as
+# they are) and made visible only where they are shown.
+_CONTROL_CHAR_RE = re.compile("[\x00-\x1f\x7f-\x9f  ]")
+_CONTROL_CHAR_NAMES = {"\n": "\\n", "\t": "\\t", "\r": "\\r"}
+
+
+def _display(text: str) -> str:
+    """``text`` for an output cell or a log line: control characters (C0, DEL,
+    C1 and the Unicode line/paragraph separators) as visible escapes."""
+
+    def escape(match) -> str:
+        char = match.group()
+        code = ord(char)
+        return _CONTROL_CHAR_NAMES.get(char) or (
+            f"\\x{code:02x}" if code < 0x100 else f"\\u{code:04x}"
+        )
+
+    return _CONTROL_CHAR_RE.sub(escape, text)
+
+
+class _ControlCharFilter(logging.Filter):
+    """Escapes control characters in this plugin's log messages and their
+    string (or exception) arguments; numbers are left for ``%d``."""
+
+    @staticmethod
+    def _clean(value):
+        if isinstance(value, str):
+            return _display(value)
+        if isinstance(value, BaseException):
+            return _display(str(value))
+        return value
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = self._clean(record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(self._clean(arg) for arg in record.args)
+        elif isinstance(record.args, dict):
+            record.args = {key: self._clean(arg) for key, arg in record.args.items()}
+        return True
+
+
+# The logger outlives a reload of this module; one filter is enough.
+if not any(type(f).__name__ == "_ControlCharFilter" for f in vollog.filters):
+    vollog.addFilter(_ControlCharFilter())
+
 # The loader only ever reads this one path, but the glob also catches the file inside
 # container root filesystems, which appear as separate superblocks in the page cache.
 PRELOAD_GLOBS = ("*/etc/ld.so.preload",)
@@ -172,6 +220,12 @@ LOADER_TARGET_MAX_SIZE = 1 << 20
 PRELOAD_FILE_MAX_SIZE = LOADER_TARGET_MAX_SIZE  # a preload list, found by name
 LOADER_MAX_SIZE = 32 << 20  # a dynamic linker or a leftover copy of one
 FILE_READ_MAX_SIZE = 256 << 20  # a library
+# The per-file budgets bound one read, not their sum: any number of sparse files
+# can sit under names this plugin reads, and each recovered file is kept until
+# the run ends. All budgeted reads of one plugin run therefore share this total;
+# once it is used up, further files are read only up to what is left of it, or
+# not at all, and their rows say so.
+TOTAL_READ_MAX_SIZE = 1 << 30
 # A dentry name is at most NAME_MAX bytes, so no name read needs to be longer.
 DENTRY_NAME_MAX = 255
 # An ELF symbol name is not searched for its terminator beyond this.
@@ -200,7 +254,35 @@ LOADER_CONFIG_NAMES = frozenset(
 # The suffix is one optional group, not a repeated one: "[^/\s]+" already spans
 # further dots, and repeating it made the match ambiguous -- exponential
 # backtracking on a token such as "/x.so.a.a.a.a[...]/z" from any scanned file.
-SO_TOKEN_RE = re.compile(r"\.so(?:\.[^/\s]+)?$")
+#
+# Even that pattern is quadratic when searched unanchored: every ".so" in the
+# text starts an attempt that runs to the next "/" or whitespace, and an
+# LD_PRELOAD value (up to ENV_AREA_MAX_SIZE) or a loader target may consist of
+# little else. ``SO_TOKEN_RE.search`` therefore decides the same question --
+# does ``\.so(?:\.[^/\s]+)?$`` match somewhere? -- with string operations, in
+# time linear in the text, and returns a bool.
+_PATH_BREAK_RE = re.compile(r"[/\s]")
+
+
+class _SoTokenMatcher:
+    """Whether a text ends like a shared-object name: ``.so``, or ``.so.``
+    followed by one or more characters that are neither "/" nor whitespace.
+
+    As with the regex ``$``, one trailing newline is ignored."""
+
+    @staticmethod
+    def search(text: str) -> bool:
+        if text.endswith("\n"):
+            text = text[:-1]
+        if text.endswith(".so"):
+            return True
+        # Only the last ".so." with something after it can work: an earlier
+        # one has the same tail to get past, and more.
+        start = text.rfind(".so.", 0, len(text) - 1)
+        return start >= 0 and _PATH_BREAK_RE.search(text, start + 4) is None
+
+
+SO_TOKEN_RE = _SoTokenMatcher()
 DYNAMIC_TOKEN_RE = re.compile(r"\$\{?(?:PLATFORM|LIB|ORIGIN)\}?")
 
 # How glibc (elf/rtld.c) reads the preload file: a "#" starts a comment that runs
@@ -524,7 +606,9 @@ class ElfInfo:
     exported: List[str] = field(default_factory=list)
     #: The symbol table could not be read to its end (no section headers --
     #: stripped, or their page not cached -- or more symbols than are parsed),
-    #: so ``exported`` is not the whole truth and an empty list proves nothing.
+    #: or there is no ``.dynsym`` or one of zero entries, which a real shared
+    #: object does not have and forged section headers can claim. ``exported``
+    #: is then not the whole truth and an empty list proves nothing.
     incomplete: bool = False
 
     def interposed(self) -> List[str]:
@@ -684,7 +768,11 @@ class ElfReader:
         Only ``.dynsym`` governs symbol interposition -- ``.symtab`` (if present at
         all in a shipped ``.so``) lists build-time symbols the loader never consults --
         so the dynamic table is used when available and the static one is only a
-        fallback for an object that has no ``.dynsym``.
+        fallback for an object that has no ``.dynsym``. That fallback, and a
+        table of zero entries, never count as a complete read: section headers
+        are not what the loader goes by, and whoever wrote the file can leave
+        ``.dynsym`` out or declare it empty (the dynamic segment, which would
+        settle it, is not parsed).
         """
         dynsym = [s for s in sections if s[0] == SHT_DYNSYM]
         symtab = [s for s in sections if s[0] == SHT_SYMTAB]
@@ -706,7 +794,7 @@ class ElfReader:
         count = min(total, 65536)
         # A page of either table that was not cached reads as zeros: null
         # symbols and empty names, which would pass for "defines nothing".
-        complete = count == total and not (
+        complete = bool(dynsym) and 0 < count == total and not (
             _has_zero_page(data, sh_offset, sh_offset + sh_size)
             or _has_zero_page(data, str_offset, str_offset + str_size)
         )
@@ -1105,6 +1193,27 @@ def _read_pages_compat(
     return b""
 
 
+def _inode_time(
+    inode: interfaces.objects.ObjectInterface, getter: str
+) -> Optional[datetime.datetime]:
+    """An inode time as a ``datetime``, or None.
+
+    The framework returns an absent-value object, not a datetime, for a time it
+    cannot convert (the epoch itself, as set by ``touch -d @0``, included), and
+    raises on an inode layout it does not know."""
+    try:
+        value = getattr(inode, getter)()
+    except (
+        AttributeError,
+        exceptions.VolatilityException,
+        ValueError,
+        TypeError,
+        OverflowError,
+    ):
+        return None
+    return value if isinstance(value, datetime.datetime) else None
+
+
 def read_inode(
     context: interfaces.context.ContextInterface,
     vmlinux_module_name: str,
@@ -1122,12 +1231,16 @@ def read_inode(
     ``ReadBudgetExceeded`` instead of being dropped or retried.
 
     Without ``max_size`` the read is held to ``limit`` instead, leniently: a
-    file declaring more (or an unreadable size) is read up to ``limit`` and the
-    result marked ``truncated``; running out of memory yields no content.
-    Either is stated in the result's ``note`` rather than raised."""
+    file declaring more is read up to ``limit`` and the result marked
+    ``truncated``. A file whose size cannot be read is read up to ``limit``
+    too; its ``note`` says so, and it is ``truncated`` if the content fills
+    ``limit`` (anything shorter is all that was cached within it). Running out
+    of memory yields no content. Each is stated in the result's ``note``
+    rather than raised."""
     layer_name = context.modules[vmlinux_module_name].layer_name
     bounded = max_size is not None
     truncated, note = False, ""
+    declared: Optional[int] = None
     if bounded:
         size = max_size
     else:
@@ -1188,28 +1301,19 @@ def read_inode(
         buffer = BytesIO()
         note = f"{path} not read: out of memory"
 
-    def safe(fn):
-        # The framework returns an absent-value object, not a datetime, for a
-        # time it cannot convert (the epoch itself, as set by ``touch -d @0``,
-        # included), and raises on an inode layout it does not know.
-        try:
-            value = fn()
-        except (
-            AttributeError,
-            exceptions.VolatilityException,
-            ValueError,
-            TypeError,
-            OverflowError,
-        ):
-            return None
-        return value if isinstance(value, datetime.datetime) else None
+    data = buffer.getvalue()
+    if not bounded and declared is None:
+        # Read up to the budget without knowing where the file ends.
+        truncated = len(data) >= limit
+        unreadable = f"size of {path} unreadable; read within the {limit}-byte budget"
+        note = f"{note}; {unreadable}" if note else unreadable
 
     return RecoveredFile(
         path=path,
         inode_addr=inode.vol.offset,
-        data=buffer.getvalue(),
-        modification_time=safe(inode.get_modification_time),
-        change_time=safe(inode.get_change_time),
+        data=data,
+        modification_time=_inode_time(inode, "get_modification_time"),
+        change_time=_inode_time(inode, "get_change_time"),
         truncated=truncated,
         note=note,
     )
@@ -1428,19 +1532,80 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
         self._limit = 0
         self._platform = "x86_64"
         self._libdir = "lib64"
+        #: Bytes recovered by this run's budgeted reads (TOTAL_READ_MAX_SIZE).
+        self._read_total = 0
+        self._read_total_warned = False
 
     # -- collection ------------------------------------------------------------
 
     @staticmethod
-    def _safe_iter(iterator) -> Iterator:
-        """Drains an iterator, ending it quietly if the underlying walk dies."""
+    def _safe_iter(iterator, what: str = "list") -> Iterator:
+        """Drains an iterator, ending it if the underlying walk dies -- with a
+        warning, since everything after that point is missing from the result."""
         while True:
             try:
                 yield next(iterator)
             except StopIteration:
                 return
-            except (exceptions.InvalidAddressException, AttributeError):
+            except (exceptions.InvalidAddressException, AttributeError) as excp:
+                vollog.warning(
+                    "The walk of the %s was aborted by a read error (%s: %s); "
+                    "entries after that point are missing and the results may "
+                    "be incomplete",
+                    what,
+                    type(excp).__name__,
+                    excp,
+                )
                 return
+
+    def _read_file(
+        self,
+        vmlinux_module_name: str,
+        inode: interfaces.objects.ObjectInterface,
+        path: str,
+        limit: int = FILE_READ_MAX_SIZE,
+    ) -> RecoveredFile:
+        """``read_inode`` within ``limit`` and within what is left of this run's
+        ``TOTAL_READ_MAX_SIZE``.
+
+        A file the total cuts short is ``truncated`` and one it leaves no room
+        for is not read at all; the result's ``note`` says which, and the first
+        such file is logged as a warning (later ones at debug level)."""
+        remaining = TOTAL_READ_MAX_SIZE - self._read_total
+        exhausted = (
+            f"the total read budget of {TOTAL_READ_MAX_SIZE} bytes per run is used up"
+        )
+        if remaining <= 0:
+            recovered = RecoveredFile(
+                path=path,
+                inode_addr=inode.vol.offset,
+                data=b"",
+                modification_time=_inode_time(inode, "get_modification_time"),
+                change_time=_inode_time(inode, "get_change_time"),
+                truncated=True,
+                note=f"{path} not read: {exhausted}",
+            )
+        else:
+            recovered = read_inode(
+                self.context,
+                vmlinux_module_name,
+                inode,
+                path,
+                limit=min(limit, remaining),
+            )
+            self._read_total += len(recovered.data)
+            if remaining >= limit or not recovered.truncated:
+                return recovered
+            recovered.note = f"{recovered.note}; {exhausted}"
+        log = vollog.debug if self._read_total_warned else vollog.warning
+        self._read_total_warned = True
+        log(
+            "%s is not read in full: %s; this and any further file is analysed "
+            "partially or not at all",
+            path,
+            exhausted,
+        )
+        return recovered
 
     @classmethod
     def get_superblocks(
@@ -1461,7 +1626,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
         seen_namespaces: Set[int] = set()
         seen_superblocks: Set[int] = set()
         for task in cls._safe_iter(
-            iter(pslist.PsList.list_tasks(context, vmlinux_module_name))
+            iter(pslist.PsList.list_tasks(context, vmlinux_module_name)), "task list"
         ):
             try:
                 nsproxy = task.nsproxy
@@ -1481,7 +1646,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                 mounts = mnt_ns.get_mount_points()
             except (exceptions.InvalidAddressException, AttributeError):
                 continue
-            for mount in cls._safe_iter(iter(mounts)):
+            for mount in cls._safe_iter(iter(mounts), "mount list"):
                 try:
                     sb_ptr = mount.get_mnt_sb()
                     if not (sb_ptr and sb_ptr.is_readable()):
@@ -1785,12 +1950,8 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                 seen_preload_inodes.add(inode_addr)
                 inode = vmlinux.object("inode", offset=inode_addr, absolute=True)
                 if self._inode_usable(inode):
-                    recovered = read_inode(
-                        self.context,
-                        vmlinux_module_name,
-                        inode,
-                        path,
-                        limit=PRELOAD_FILE_MAX_SIZE,
+                    recovered = self._read_file(
+                        vmlinux_module_name, inode, path, limit=PRELOAD_FILE_MAX_SIZE
                     )
                     if copy_match(path):
                         recovered.kind = "copy"
@@ -1915,9 +2076,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             if inode_addr not in analysed:
                 inode = vmlinux.object("inode", offset=inode_addr, absolute=True)
                 if self._inode_usable(inode):
-                    recovered = read_inode(
-                        self.context, vmlinux_module_name, inode, lib_path
-                    )
+                    recovered = self._read_file(vmlinux_module_name, inode, lib_path)
                     analysed[inode_addr] = (
                         recovered,
                         ElfReader.parse(recovered.data),
@@ -1989,9 +2148,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                 if not self._inode_usable(inode):
                     analysed[inode_addr] = None
                     continue
-                recovered = read_inode(
-                    self.context, vmlinux_module_name, inode, entry.library
-                )
+                recovered = self._read_file(vmlinux_module_name, inode, entry.library)
                 analysed[inode_addr] = (recovered, ElfReader.parse(recovered.data))
                 vollog.info(
                     "%s is mapped by running processes but was not reachable "
@@ -2095,7 +2252,8 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
         """One entry per (variable, library) found in any task's environment."""
         found: Dict[Tuple[str, str], PreloadEntry] = {}
         for task in self._safe_iter(
-            iter(pslist.PsList.list_tasks(self.context, vmlinux_module_name))
+            iter(pslist.PsList.list_tasks(self.context, vmlinux_module_name)),
+            "task list",
         ):
             block = self._read_environment(task)
             if not block:
@@ -2292,14 +2450,13 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             inode = vmlinux.object("inode", offset=inode_addr, absolute=True)
             if not self._inode_usable(inode):
                 continue
-            recovered = read_inode(
-                self.context,
-                vmlinux_module_name,
-                inode,
-                path,
-                limit=PRELOAD_SCAN_MAX_SIZE,
+            recovered = self._read_file(
+                vmlinux_module_name, inode, path, limit=PRELOAD_SCAN_MAX_SIZE
             )
             if recovered.truncated or not self._looks_like_preload(recovered.data):
+                # Not kept, so it does not count against the total either: the
+                # scan may look at every small file in the page cache.
+                self._read_total -= len(recovered.data)
                 continue
             seen_inodes.add(inode_addr)
             recovered.kind = "disguised"
@@ -2520,7 +2677,8 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
         (``ld-*.so.tmp`` and the like) is cached: the two differ only in that
         string. Otherwise the loader's other absolute-path strings are narrowed
         down by elimination and cross-checked against the page cache. A loader
-        whose ``.rodata`` is not fully cached cannot be judged and is reported as
+        whose ``.rodata`` is not fully cached, or cannot be located in content
+        that was not recovered in full, cannot be judged and is reported as
         inconclusive rather than patched.
         """
         vmlinux = self.context.modules[vmlinux_module_name]
@@ -2533,8 +2691,8 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             inode = vmlinux.object("inode", offset=inode_addr, absolute=True)
             if not self._inode_usable(inode):
                 continue
-            recovered = read_inode(
-                self.context, vmlinux_module_name, inode, path, limit=LOADER_MAX_SIZE
+            recovered = self._read_file(
+                vmlinux_module_name, inode, path, limit=LOADER_MAX_SIZE
             )
             data = recovered.data
             if not data.startswith(ELF_MAGIC):
@@ -2545,16 +2703,36 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                 checks.append(LoaderCheck(recovered, "intact"))
                 continue
             # Absent. Decide whether the string's home, .rodata, was actually read
-            # before calling the loader patched; a missing page reads as zeros,
-            # and a file cut at the read budget may hold the string further on.
+            # before calling the loader patched; a missing page reads as zeros.
+            # Where the section headers locate .rodata and all of it lies in
+            # the recovered content, only a hole inside it leaves the question
+            # open: what else of the file is missing (an uncached tail of debug
+            # sections, a cut at the read budget) cannot hold the string.
+            # Otherwise .rodata cannot be located or was not read to its end
+            # -- the recovered content ends with the last cached page -- and
+            # anything cut at the budget, shorter than the inode's size or of
+            # unknown size is undecided.
+            declared = _declared_size(inode)
             rodata = ElfReader.section_range(data, ".rodata")
-            start, size = rodata if rodata else (0, len(data))
-            if recovered.truncated or self._has_zero_page(data, start, start + size):
+            if rodata is not None and rodata[0] + rodata[1] <= len(data):
+                start, size = rodata
+                undecided = self._has_zero_page(data, start, start + size)
+            else:
+                start, size = rodata if rodata else (0, len(data))
+                undecided = (
+                    recovered.truncated
+                    or declared is None
+                    or len(data) < declared
+                    or self._has_zero_page(data, start, start + size)
+                )
+            if undecided:
                 vollog.warning(
                     "Dynamic linker %s does not contain the /etc/ld.so.preload "
-                    "string, but part of its read-only data is not cached; "
-                    "inconclusive",
+                    "string, but it was not recovered in full (%d of %s bytes) "
+                    "or part of its read-only data is not cached; inconclusive",
                     path,
+                    len(data),
+                    "an unreadable number of" if declared is None else declared,
                 )
                 checks.append(LoaderCheck(recovered, "inconclusive"))
                 continue
@@ -2651,8 +2829,8 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             inode = vmlinux.object("inode", offset=inode_addr, absolute=True)
             if not self._inode_usable(inode):
                 continue
-            recovered = read_inode(
-                self.context, vmlinux_module_name, inode, path, limit=LOADER_MAX_SIZE
+            recovered = self._read_file(
+                vmlinux_module_name, inode, path, limit=LOADER_MAX_SIZE
             )
             # The name says loader copy; the content has to agree when it is
             # available, or a stray text file under such a name would be reported.
@@ -2770,7 +2948,9 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             return
 
         if has_maple:
-            for slot in self._safe_iter(iter(mm.mm_mt.get_slot_iter())):
+            for slot in self._safe_iter(
+                iter(mm.mm_mt.get_slot_iter()), "memory mappings of a task"
+            ):
                 try:
                     addr = int(slot)
                 except (TypeError, ValueError):
@@ -2974,7 +3154,8 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                 return ()
 
         for task in self._safe_iter(
-            iter(pslist.PsList.list_tasks(self.context, self.config["kernel"]))
+            iter(pslist.PsList.list_tasks(self.context, self.config["kernel"])),
+            "task list",
         ):
             try:
                 pid = int(task.pid)
@@ -3143,7 +3324,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             if elf is not None and elf.valid:
                 functions = elf.exported if show_all else elf.interposed()
                 if functions:
-                    hooks = self._wrap(", ".join(functions), 48)
+                    hooks = self._wrap(_display(", ".join(functions)), 48)
                 else:
                     # "None" only if the whole symbol table was read; otherwise
                     # the list is unknown, not empty.
@@ -3151,8 +3332,8 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                 if elf.incomplete:
                     notes.append(
                         "symbol table not fully readable (section headers stripped, "
-                        "not cached or beyond the read budget); the overridden "
-                        "functions are "
+                        "not cached or beyond the read budget, or no or an empty "
+                        ".dynsym); the overridden functions are "
                         + ("incomplete" if functions else "unknown")
                     )
                 if not functions and entry.env_var and elf.exported:
@@ -3189,7 +3370,8 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                         "library", recovered.modification_time, recovered.change_time
                     )
                 )
-            note = "; ".join(part for part in notes if part)
+            # Escaped as a whole, before folding adds its own line breaks.
+            note = _display("; ".join(part for part in notes if part))
 
             yield (
                 0,
@@ -3197,10 +3379,10 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
                     (
                         f"{entry.env_var} (environment)"
                         if entry.env_var
-                        else entry.preload_path
+                        else _display(entry.preload_path)
                     ),
                     (entry.preload_mtime or na()) if not entry.env_var else nap(),
-                    entry.library,
+                    _display(entry.library),
                     (recovered.modification_time if recovered else None) or na(),
                     hooks,
                     (
@@ -3260,13 +3442,13 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             yield (
                 0,
                 (
-                    check.recovered.path,
+                    _display(check.recovered.path),
                     check.recovered.modification_time or na(),
                     "(dynamic linker)",
                     na(),
                     na(),
                     nap(),
-                    self._wrap(f"{note}; {stamp}" if stamp else note, 48),
+                    self._wrap(_display(f"{note}; {stamp}" if stamp else note), 48),
                 ),
             )
 
@@ -3285,13 +3467,13 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             yield (
                 0,
                 (
-                    artifact.path,
+                    _display(artifact.path),
                     artifact.modification_time or na(),
                     "(dynamic linker copy)",
                     na(),
                     na(),
                     nap(),
-                    self._wrap(f"{note}; {stamp}" if stamp else note, 48),
+                    self._wrap(_display(f"{note}; {stamp}" if stamp else note), 48),
                 ),
             )
 
@@ -3330,7 +3512,7 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
         modified = timeliner.TimeLinerType.MODIFIED
         changed = timeliner.TimeLinerType.CHANGED
         for preload in self._preload_files:
-            description = f"ld.so.preload file {preload.path}"[:400]
+            description = _display(f"ld.so.preload file {preload.path}")[:400]
             if preload.modification_time:
                 yield description, modified, preload.modification_time
             if preload.change_time:
@@ -3340,9 +3522,9 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
             if recovered is None:
                 continue
             if entry.env_var:
-                description = f"{entry.env_var} library {entry.library}"[:400]
+                description = _display(f"{entry.env_var} library {entry.library}")[:400]
             else:
-                description = f"ld.so.preload library {entry.library}"[:400]
+                description = _display(f"ld.so.preload library {entry.library}")[:400]
             if recovered.modification_time:
                 yield description, modified, recovered.modification_time
             if recovered.change_time:
@@ -3350,13 +3532,13 @@ class LdPreload(plugins.PluginInterface, timeliner.TimeLinerInterface):
         for check in self._loader_checks:
             if check.state != "patched":
                 continue
-            description = f"patched dynamic linker {check.recovered.path}"[:400]
+            description = _display(f"patched dynamic linker {check.recovered.path}")[:400]
             if check.recovered.modification_time:
                 yield description, modified, check.recovered.modification_time
             if check.recovered.change_time:
                 yield description, changed, check.recovered.change_time
         for artifact in self._linker_artifacts:
-            description = f"dynamic linker copy {artifact.path}"[:400]
+            description = _display(f"dynamic linker copy {artifact.path}")[:400]
             if artifact.modification_time:
                 yield description, modified, artifact.modification_time
             if artifact.change_time:
